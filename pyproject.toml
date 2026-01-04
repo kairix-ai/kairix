@@ -1,0 +1,25 @@
+[project]
+name = "kairix"
+version = "0.1.0"
+description = "Operationalizing Modern Statistics - Distributed Survival Analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyspark>=4.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "lifelines>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

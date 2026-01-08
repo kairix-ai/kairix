@@ -3,7 +3,7 @@
 from typing import Any
 
 from pyspark.sql import DataFrame
-from pyspark.sql.types import DoubleType, IntegerType
+from pyspark.sql.types import DoubleType, IntegerType, LongType, FloatType
 
 
 def validate_input_schema(
@@ -31,7 +31,7 @@ def validate_input_schema(
 
     # Validate duration column type (numeric)
     duration_dtype = df.schema[duration_col].dataType
-    if not isinstance(duration_dtype, (DoubleType, IntegerType)):
+    if not isinstance(dtype, (DoubleType, IntegerType, LongType, FloatType)):
         raise ValueError(
             f"Duration column '{duration_col}' must be numeric (DoubleType or IntegerType), "
             f"found {duration_dtype}"
@@ -39,9 +39,9 @@ def validate_input_schema(
 
     # Validate event column type (integer)
     event_dtype = df.schema[event_col].dataType
-    if not isinstance(event_dtype, IntegerType):
+    if not isinstance(event_dtype, (IntegerType, LongType, DoubleType, FloatType)):
         raise ValueError(
-            f"Event column '{event_col}' must be IntegerType, found {event_dtype}"
+            f"Event column '{event_col}' must be numeric (Int/Long/Double), found {event_dtype}"
         )
 
     # Validate no negative durations

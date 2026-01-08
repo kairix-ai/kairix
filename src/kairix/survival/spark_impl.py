@@ -336,3 +336,12 @@ class KaplanMeier:
         ).withColumn(
             "ci_upper", upper_bound
         )
+    
+    # to make api compatible
+    @property
+    def timeline_(self):
+        return self.survival_df.index.values
+
+    @property
+    def survival_function_(self):
+        return self.survival_df

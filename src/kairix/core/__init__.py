@@ -22,7 +22,5 @@ __all__ = [
     # Validation
     "validate_input_schema",
     # Reporting
-    "interpret_kaplan_meier",
-    "interpret_cox_model",
-    "generate_summary_report",
+    "interpret_kairix_metrics",
 ]

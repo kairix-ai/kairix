@@ -9,9 +9,7 @@ This module provides shared infrastructure used across all analysis modules:
 from kairix.core.engine import get_backend, is_pandas, is_spark
 from kairix.core.validation import validate_input_schema
 from kairix.core.reporting import (
-    interpret_kaplan_meier,
-    interpret_cox_model,
-    generate_summary_report,
+    interpret_kairix_metrics,
 )
 
 __all__ = [

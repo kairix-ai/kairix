@@ -19,11 +19,9 @@ Example:
 from kairix.survival.estimator import SurvivalEstimator
 from kairix.survival.local_impl import KaplanMeierFitter
 from kairix.survival.spark_impl import KaplanMeier
-from kairix.survival.utils import generate_synthetic_survival_data
 
 __all__ = [
     "SurvivalEstimator",  # Unified interface
     "KaplanMeierFitter",  # Local (pandas/lifelines)
     "KaplanMeier",        # Distributed (Spark)
-    "generate_synthetic_survival_data",
 ]

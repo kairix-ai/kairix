@@ -1,4 +1,4 @@
-"""Distributed Kaplan-Meier estimator for large-scale survival analysis."""
+"""Distributed Kaplan-Meier estimator for large-scale survival analysis using PySpark."""
 
 from typing import Optional, Dict, Any
 

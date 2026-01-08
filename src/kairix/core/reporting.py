@@ -1,141 +1,100 @@
-"""Interpretation Layer for standardized English outputs.
-
-This module provides human-readable interpretations of survival analysis results.
-"""
-
 from typing import Dict, Any, Optional
 
-
-def interpret_kaplan_meier(
+def interpret_kairix_metrics(
     n_samples: int,
-    median_survival: Optional[float],
-    event_rate: float,
-    ci_lower: Optional[float] = None,
-    ci_upper: Optional[float] = None,
-) -> str:
-    """Generate a standardized English interpretation of Kaplan-Meier results.
-    
-    Args:
-        n_samples: Number of samples in the analysis.
-        median_survival: Median survival time, or None if not reached.
-        event_rate: Proportion of events (non-censored observations).
-        ci_lower: Lower bound of median survival confidence interval.
-        ci_upper: Upper bound of median survival confidence interval.
-        
-    Returns:
-        Human-readable interpretation string.
+    median_time: Optional[float],
+    cum_event_rate: float,
+    max_time_observed: float,
+    prob_at_max_time: float,
+    mode: str = 'retention', 
+    time_unit: str = 'days'
+) -> Dict[str, Any]:
     """
-    parts = []
-    
-    # Sample size description
-    if n_samples < 100:
-        size_desc = "small sample"
-    elif n_samples < 1000:
-        size_desc = "moderate sample"
-    elif n_samples < 10000:
-        size_desc = "large sample"
-    else:
-        size_desc = "very large sample"
-    
-    parts.append(
-        f"Based on a {size_desc} of {n_samples:,} observations "
-        f"with an event rate of {event_rate:.1%}, "
-    )
-    
-    # Median survival interpretation
-    if median_survival is not None:
-        median_str = f"{median_survival:.2f}"
-        if ci_lower is not None and ci_upper is not None:
-            median_str = f"{median_str} (95% CI: {ci_lower:.2f} - {ci_upper:.2f})"
-        parts.append(f"the median survival time is {median_str}. ")
-    else:
-        parts.append(
-            "the median survival time was not reached during the observation period. "
-            "This suggests that more than 50% of subjects survived beyond "
-            "the maximum follow-up time. "
-        )
-    
-    return "".join(parts)
+    Generates business-aligned interpretation of survival analysis results, 
+    handling the semantic inversion between Retention (staying) and Conversion (acting).
 
-
-def interpret_cox_model(
-    n_samples: int,
-    n_events: int,
-    concordance_index: float,
-    coefficients: Dict[str, float],
-) -> str:
-    """Generate a standardized English interpretation of Cox model results.
-    
     Args:
-        n_samples: Number of samples in the analysis.
-        n_events: Number of events observed.
-        concordance_index: C-index (model discrimination ability).
-        coefficients: Dictionary of feature coefficients.
-        
-    Returns:
-        Human-readable interpretation string.
-    """
-    parts = []
-    
-    parts.append(
-        f"Cox proportional hazards model fitted on {n_samples:,} observations "
-        f"with {n_events:,} events. "
-    )
-    
-    # C-index interpretation
-    if concordance_index < 0.5:
-        c_desc = "poor"
-    elif concordance_index < 0.7:
-        c_desc = "fair"
-    elif concordance_index < 0.8:
-        c_desc = "good"
-    else:
-        c_desc = "excellent"
-    
-    parts.append(
-        f"The model has a concordance index of {concordance_index:.3f}, "
-        f"indicating {c_desc} discriminatory ability. "
-    )
-    
-    # Coefficient interpretation (top features by absolute value)
-    sorted_coefs = sorted(coefficients.items(), key=lambda x: abs(x[1]), reverse=True)
-    if sorted_coefs:
-        parts.append("\n\nKey findings:\n")
-        for name, coef in sorted_coefs[:5]:  # Top 5 features
-            hr = round(float(coef), 2)
-            direction = "increases" if coef > 0 else "decreases"
-            parts.append(
-                f"- {name}: Each unit increase {direction} the hazard by {abs(hr):.2f} "
-                f"(HR = {hr:.2f})\n"
-            )
-    
-    return "".join(parts)
+        n_samples: Total cohort size.
+        median_time: Time at which S(t) = 0.5. None if S(t) never drops below 0.5.
+        cum_event_rate: Total % of events observed in the dataset (e.g., 0.05 for 5%).
+        max_time_observed: The furthest point in time (t) we have data for.
+        prob_at_max_time: The Kaplan-Meier probability S(t) at max_time_observed.
+        mode: 'retention' (Event = Churn/Death) or 'conversion' (Event = Purchase/Click).
+        time_unit: Label for time axis (e.g., 'days', 'hours').
 
-
-def generate_summary_report(
-    model_type: str,
-    stats: Dict[str, Any],
-    interpretation: str,
-) -> str:
-    """Generate a complete summary report for a survival model.
-    
-    Args:
-        model_type: Type of survival model (e.g., "Kaplan-Meier", "Cox").
-        stats: Dictionary of model statistics.
-        interpretation: Human-readable interpretation string.
-        
     Returns:
-        Complete summary report string.
+        Dict containing:
+        - 'summary': A polished, executive-summary style string.
+        - 'structured_metrics': Raw numbers with business-appropriate keys for dashboards.
     """
-    report = f"=== {model_type} Analysis Summary ===\n\n"
     
-    for key, value in stats.items():
-        if isinstance(value, float):
-            formatted = f"{value:.4f}" if value < 0.01 else f"{value:.4f}"
+    narrative = ""
+    metrics_payload = {
+        "n": n_samples,
+        "max_event_horizon": max_time_observed,
+        "mode": mode
+    }
+
+    # ---------------------------------------------------------
+    # MODE 1: RETENTION (Churn Analysis)
+    # Goal: Keep S(t) high. Event (Churn) is BAD.
+    # ---------------------------------------------------------
+    if mode == 'retention':
+        # Metric 1: Half-Life (The "Bleed" Metric)
+        if median_time:
+            kpi_text = f"The cohort **Half-Life** is {median_time:.1f} {time_unit}."
+            implication = "50% of users have churned by this point."
+            metrics_payload["half_life"] = median_time
+            metrics_payload["retention_status"] = "High Churn (Median reached)"
         else:
-            formatted = str(value)
-        report += f"{key.replace('_', ' ').title()}: {formatted}\n"
-    
-    report += f"\n=== Interpretation ===\n{interpretation}\n"
-    
-    return report
+            kpi_text = (f"The cohort Half-Life (>50% retention) exceeds the "
+                        f"observation window of {max_time_observed} {time_unit}.")
+            implication = "Retention is stable."
+            metrics_payload["half_life"] = None
+            metrics_payload["retention_status"] = "Strong (Median not reached)"
+
+        # Metric 2: Terminal Retention
+        metrics_payload["retention_at_max"] = prob_at_max_time
+        
+        narrative = (
+            f"**Retention Analysis:** {kpi_text} {implication} "
+            f"At the end of {max_time_observed} {time_unit}, "
+            f"{prob_at_max_time:.1%} of users remain active."
+        )
+
+    # ---------------------------------------------------------
+    # MODE 2: CONVERSION (Funnel Analysis)
+    # Goal: Drive S(t) to 0. Event (Purchase) is GOOD.
+    # Metric focus: 1 - S(t)
+    # ---------------------------------------------------------
+    elif mode == 'conversion':
+        # Invert S(t) to get Cumulative Conversion Rate
+        total_conversion = 1.0 - prob_at_max_time
+        metrics_payload["total_conversion_rate"] = total_conversion
+        
+        # Metric 1: Velocity (How fast do they act?)
+        if median_time:
+            # High Velocity Case (e.g., Micro-funnels, OTP entry)
+            kpi_text = (f"**High Velocity:** The majority (50%) of users convert "
+                        f"within {median_time:.1f} {time_unit}.")
+            metrics_payload["median_time_to_convert"] = median_time
+            metrics_payload["velocity_status"] = "High (Median reached)"
+        else:
+            # Low Velocity Case (Standard SaaS Sales / E-commerce)
+            kpi_text = (f"**Conversion Ceiling:** The conversion curve has not crossed 50%. "
+                        f"Median time-to-convert is undefined for this window.")
+            metrics_payload["median_time_to_convert"] = None
+            metrics_payload["velocity_status"] = "Standard (Median not reached)"
+
+        narrative = (
+            f"**Funnel Efficiency:** At {max_time_observed} {time_unit}, the cumulative conversion "
+            f"reaches {total_conversion:.1%}. {kpi_text}"
+        )
+
+    else:
+        raise ValueError(f"Invalid mode '{mode}'. Use 'retention' or 'conversion'.")
+
+    return {
+        "summary": narrative,
+        "structured_metrics": metrics_payload
+    }

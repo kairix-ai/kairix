@@ -6,6 +6,7 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, Row
 
+# Ensure kairix.core.validation is available or mock this for standalone testing
 from kairix.core.validation import validate_input_schema
 
 
@@ -28,17 +29,8 @@ class KaplanMeier:
             - n_at_risk: Number of subjects at risk at this time
             - n_events: Number of events at this time
             - survival_probability: Estimated survival probability
+            - variance: Variance of the survival probability (Greenwood)
         is_fitted: Whether the model has been fitted to data
-
-    Examples:
-        >>> from kairix.survival import KaplanMeier, generate_synthetic_survival_data
-        >>> from pyspark.sql import SparkSession
-        >>> spark = SparkSession.builder.getOrCreate()
-        >>> df = generate_synthetic_survival_data(spark, n_samples=10000)
-        >>> km = KaplanMeier()
-        >>> km.fit(df, duration_col="duration", event_col="event")
-        >>> result = km.survival_df
-        >>> result.show()
     """
 
     def __init__(self) -> None:
@@ -56,43 +48,29 @@ class KaplanMeier:
     ) -> "KaplanMeier":
         """Fit the Kaplan-Meier estimator to survival data.
 
-        This method implements the distributed Kaplan-Meier algorithm:
-
-        1. Validates input schema and data quality
-        2. Performs adaptive discretization of duration values
-        3. Aggregates event counts per time bin
-        4. Computes risk sets using window functions
-        5. Calculates survival probabilities with numerical stability
-
         Args:
             df: Input PySpark DataFrame containing survival data.
             duration_col: Name of the column containing duration/time-to-event.
             event_col: Name of the column containing event indicator (0 or 1).
             max_bins: Maximum number of discretization bins. Default is 100,000.
-                Higher values provide better precision but require more memory.
 
         Returns:
             Self: The fitted estimator instance for method chaining.
-
-        Raises:
-            ValueError: If duration or event columns contain invalid data.
-            TypeError: If df is not a PySpark DataFrame.
-
-        Note:
-            This method is lazy and does not trigger computation until the
-            result is accessed. It avoids collect() and toPandas() operations.
         """
         # Validate input
         validate_input_schema(df, duration_col, event_col)
 
-        # Get global statistics without collecting
+        # 1. OPTIMIZATION: Get all global stats in a SINGLE pass
+        # We calculate total_events here to support Conversion Rate logic downstream
         stats_row: Row = df.select(
             F.count(F.lit(1)).alias("n_samples"),
+            F.sum(event_col).alias("total_events"),
             F.min(duration_col).alias("min_duration"),
             F.max(duration_col).alias("max_duration"),
         ).first()
 
         n_samples = stats_row["n_samples"]
+        total_events = stats_row["total_events"]
         min_duration = stats_row["min_duration"]
         max_duration = stats_row["max_duration"]
 
@@ -112,6 +90,7 @@ class KaplanMeier:
         # Store fitted parameters
         self._stats = {
             "n_samples": n_samples,
+            "total_events": total_events,
             "min_duration": min_duration,
             "max_duration": max_duration,
             "resolution": resolution,
@@ -127,9 +106,7 @@ class KaplanMeier:
         )
 
         # Step 2: Aggregation (Reduce)
-        # Group by discretized duration and calculate:
-        # - d_t: sum of events (number of events at this time)
-        # - total_observed: count of observations in this bin
+        # Group by discretized duration
         aggregated_df = discretized_df.groupBy("duration_bin").agg(
             F.sum(event_col).alias("d_t"),  # Number of events at this time
             F.count(F.lit(1)).alias("total_observed"),  # Number at risk at this time
@@ -137,26 +114,23 @@ class KaplanMeier:
 
         # Step 3: Risk Set Calculation (Window)
         # Calculate risk set using window functions
-        # Order by duration to ensure proper temporal ordering
         window_spec = Window.orderBy("duration_bin").rowsBetween(
             Window.unboundedPreceding, Window.currentRow
         )
 
-        # Calculate cumulative sum of total_observed (all observations up to current time)
+        # Calculate cumulative sum of total_observed
         aggregated_df = aggregated_df.withColumn(
             "cumulative_observed",
             F.sum("total_observed").over(window_spec),
         )
 
         # Risk set: N - cumulative_observed + total_observed (at current time)
-        # At time t, n_t = total_population - number who have already had events/time < t
         aggregated_df = aggregated_df.withColumn(
             "n_at_risk",
             F.lit(n_samples) - F.col("cumulative_observed") + F.col("total_observed"),
         )
 
         # Step 4: Survival Probability (Log-Sum-Exp Trick)
-        # Calculate log survival probability with numerical stability
         # Using log(1 - d_t / n_t) to avoid underflow
         aggregated_df = aggregated_df.withColumn(
             "log_survival_conditional",
@@ -166,7 +140,6 @@ class KaplanMeier:
             ),
         )
 
-        # Calculate cumulative log survival using running sum
         log_survival_window = Window.orderBy("duration_bin").rowsBetween(
             Window.unboundedPreceding, Window.currentRow
         )
@@ -177,7 +150,6 @@ class KaplanMeier:
         )
 
         # Convert back to survival probability using exp
-        # Clamp to [0, 1] to handle numerical edge cases
         aggregated_df = aggregated_df.withColumn(
             "survival_probability",
             F.exp(F.col("cumulative_log_survival")),
@@ -192,8 +164,6 @@ class KaplanMeier:
         )
 
         # Step 5: Variance Calculation (Greenwood's Formula)
-        # Greenwood's formula: Var(S(t)) = S(t)^2 * sum(d_j / (n_j * (n_j - d_j)))
-        # Calculate the variance contribution for each time point
         aggregated_df = aggregated_df.withColumn(
             "greenwood_term",
             F.when(
@@ -202,13 +172,11 @@ class KaplanMeier:
             ).otherwise(0.0)
         )
 
-        # Calculate cumulative sum of Greenwood's terms
         aggregated_df = aggregated_df.withColumn(
             "cumulative_greenwood",
             F.sum("greenwood_term").over(log_survival_window),
         )
 
-        # Calculate variance: Var(S(t)) = S(t)^2 * cumulative_greenwood
         aggregated_df = aggregated_df.withColumn(
             "variance",
             F.pow(F.col("survival_probability"), 2) * F.col("cumulative_greenwood"),
@@ -230,7 +198,7 @@ class KaplanMeier:
         ).orderBy("duration")
 
         # PERFORMANCE CRITICAL: Cache the small aggregated result
-        # This prevents re-scanning the raw 100M rows for every subsequent query.
+        # This prevents re-scanning the raw rows for every subsequent query.
         self.survival_df.cache()
 
         self.is_fitted = True
@@ -244,11 +212,8 @@ class KaplanMeier:
             duration: Time point at which to estimate survival probability.
 
         Returns:
-            Estimated survival probability at the given duration.
-            Returns 0.0 if duration exceeds the maximum observed time.
-
-        Raises:
-            ValueError: If the model has not been fitted yet.
+            Estimated survival probability. Returns 1.0 if duration < min,
+            or the last observed value if duration > max.
         """
         if not self.is_fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
@@ -262,7 +227,8 @@ class KaplanMeier:
         ).first()
 
         if result is None:
-            return 1.0  # No data, assume full survival
+            # Duration is smaller than the smallest observed duration
+            return 1.0
 
         return float(result["survival_probability"])
 
@@ -272,9 +238,6 @@ class KaplanMeier:
         Returns:
             Duration at which survival probability drops to 0.5 or below.
             Returns None if median is not reached in the observed data.
-
-        Raises:
-            ValueError: If the model has not been fitted yet.
         """
         if not self.is_fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
@@ -282,6 +245,9 @@ class KaplanMeier:
         if self.survival_df is None:
             raise ValueError("Survival DataFrame is not available.")
 
+        # Spark Lazy Evaluation Optimization:
+        # We only need the FIRST row where prob <= 0.5.
+        # This scans the small cached dataframe, not the original data.
         result = self.survival_df.filter(
             F.col("survival_probability") <= 0.5
         ).first()
@@ -292,19 +258,26 @@ class KaplanMeier:
         return float(result["duration"])
 
     def summary(self) -> Dict[str, Any]:
-        """Get a summary of the fitted model.
+        """Get a summary of the fitted model including business metrics.
 
         Returns:
             Dictionary containing model summary statistics.
-
-        Raises:
-            ValueError: If the model has not been fitted yet.
         """
         if not self.is_fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
 
+        n_samples = self._stats.get("n_samples", 0)
+        total_events = self._stats.get("total_events", 0)
+
+        # Calculate Median Survival (this triggers a small Spark job on cached DF)
+        median = self.median_survival()
+
         return {
-            "n_samples": self._stats.get("n_samples"),
+            "n_samples": n_samples,
+            "total_events": total_events,
+            # This allows the Interpreter to calculate global conversion rate:
+            "event_rate": total_events / n_samples if n_samples > 0 else 0.0,
+            "median_survival": median,
             "min_duration": self._stats.get("min_duration"),
             "max_duration": self._stats.get("max_duration"),
             "duration_col": self._stats.get("duration_col"),
@@ -318,16 +291,13 @@ class KaplanMeier:
         """Get survival curve with confidence intervals.
 
         Uses the log-log transformation for confidence intervals,
-        which provides better coverage for extreme values.
+        which provides better coverage for extreme values (Petos/Greenwood).
 
         Args:
-            confidence_level: Confidence level for intervals. Default is 0.95 (95% CI).
+            confidence_level: Confidence level for intervals (e.g., 0.95).
 
         Returns:
-            DataFrame with survival probabilities and confidence bounds.
-
-        Raises:
-            ValueError: If the model has not been fitted yet.
+            DataFrame with 'ci_lower' and 'ci_upper' columns appended.
         """
         if not self.is_fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
@@ -339,12 +309,12 @@ class KaplanMeier:
         se = F.sqrt(F.col("variance"))
 
         # Calculate log-log transformation for CI
-        # Using the Petos/M Greenwood transformation
+        # log(-log(S(t)))
         log_log_survival = F.log(-F.log(F.col("survival_probability")))
         se_log_log = se / (F.col("survival_probability") * F.log(F.col("survival_probability")))
 
         # Z-score for confidence level
-        from scipy import stats  # Lazy import for z-score
+        from scipy import stats  # Lazy import to avoid heavy dependency at module level
         z_score = stats.norm.ppf(1 - (1 - confidence_level) / 2)
 
         # Calculate log-log CI bounds

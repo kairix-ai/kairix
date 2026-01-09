@@ -337,11 +337,21 @@ class KaplanMeier:
             "ci_upper", upper_bound
         )
     
-    # to make api compatible
+    # to make api compatible with Lifelines
     @property
     def timeline_(self):
-        return self.survival_df.index.values
+        """Return timeline as numpy array for compatibility with Lifelines."""
+        if self.survival_df is None:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+        # Collect the duration column and convert to numpy array
+        pdf = self.survival_df.select("duration").toPandas()
+        return pdf["duration"].values
 
     @property
     def survival_function_(self):
-        return self.survival_df
+        """Return survival function as pandas Series for compatibility with Lifelines."""
+        if self.survival_df is None:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+        # Collect the survival probability column and return as pandas Series
+        pdf = self.survival_df.select("survival_probability").toPandas()
+        return pdf["survival_probability"]

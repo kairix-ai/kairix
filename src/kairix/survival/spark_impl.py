@@ -367,3 +367,14 @@ class KaplanMeier:
         if median is None:
             return float('inf')
         return median
+
+    # Aliases for compatibility with user's script
+    @property
+    def timeline(self):
+        """Alias for timeline_ for compatibility."""
+        return self.timeline_
+
+    @property
+    def survival_prob(self):
+        """Alias for survival_function_ for compatibility."""
+        return self.survival_function_.values

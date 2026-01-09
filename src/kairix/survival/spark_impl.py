@@ -355,3 +355,15 @@ class KaplanMeier:
         # Collect the survival probability column and return as pandas Series
         pdf = self.survival_df.select("survival_probability").toPandas()
         return pdf["survival_probability"]
+
+    @property
+    def median_survival_time_(self) -> float:
+        """Return median survival time for compatibility with Lifelines.
+        
+        Returns:
+            Median survival time. Returns inf if median is not reached.
+        """
+        median = self.median_survival()
+        if median is None:
+            return float('inf')
+        return median

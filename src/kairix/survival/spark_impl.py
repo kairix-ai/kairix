@@ -44,7 +44,7 @@ class KaplanMeier:
         df: DataFrame,
         duration_col: str,
         event_col: str,
-        max_bins: int = 100000,
+        bins: int = 10000,
     ) -> "KaplanMeier":
         """Fit the Kaplan-Meier estimator to survival data.
 
@@ -52,7 +52,7 @@ class KaplanMeier:
             df: Input PySpark DataFrame containing survival data.
             duration_col: Name of the column containing duration/time-to-event.
             event_col: Name of the column containing event indicator (0 or 1).
-            max_bins: Maximum number of discretization bins. Default is 100,000.
+            bins: Number of discretization bins. Default is 10000.
 
         Returns:
             Self: The fitted estimator instance for method chaining.
@@ -85,7 +85,7 @@ class KaplanMeier:
         if duration_range == 0:
             resolution = 1.0
         else:
-            resolution = duration_range / max_bins
+            resolution = duration_range / bins
 
         # Store fitted parameters
         self._stats = {

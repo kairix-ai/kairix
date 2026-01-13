@@ -149,6 +149,7 @@ class SurvivalTester:
         group_col: str = "variant",
         test_type: str = "log_rank",
         alpha: float = 0.05,
+        bins: int = 10000,
     ) -> Dict[str, Any]:
         """Run a statistical test comparing survival curves between two groups."""
         # Get unique groups
@@ -170,7 +171,7 @@ class SurvivalTester:
         # Dispatch to appropriate implementation
         if isinstance(df, SparkDataFrame):
             result = self._run_test_spark(
-                df, duration_col, event_col, group_col, test_type, alpha
+                df, duration_col, event_col, group_col, test_type, alpha, bins
             )
         else:
             result = self._run_test_pandas(
@@ -273,6 +274,7 @@ class SurvivalTester:
         group_col: str,
         test_type: str,
         alpha: float,
+        bins: int = 10000,
     ) -> LogRankResult:
         """Run log-rank test using PySpark (distributed implementation)."""
         # Validate input schema
@@ -304,7 +306,7 @@ class SurvivalTester:
         
         # Calculate resolution for discretization
         duration_range = max_dur - min_dur
-        resolution = 1.0 if duration_range == 0 else duration_range / 10000
+        resolution = 1.0 if duration_range == 0 else duration_range / bins
         
         # Step 1: Global Discretization (Map)
         discretized_df = df.withColumn(
@@ -520,6 +522,7 @@ class SurvivalTester:
         duration_col: str,
         event_col: str,
         group_col: str = "variant",
+        bins: int = 10000,
     ) -> CriticalTimeResult:
         """Find the critical time when the largest difference between groups occurs."""
         # Get unique groups
@@ -541,7 +544,7 @@ class SurvivalTester:
         # Dispatch to appropriate implementation
         if isinstance(df, SparkDataFrame):
             return self._find_critical_time_spark(
-                df, duration_col, event_col, group_col, group_1_name, group_2_name
+                df, duration_col, event_col, group_col, group_1_name, group_2_name, bins
             )
         else:
             return self._find_critical_time_pandas(
@@ -646,6 +649,7 @@ class SurvivalTester:
         group_col: str,
         group_1_name: str,
         group_2_name: str,
+        bins: int = 10000,
     ) -> CriticalTimeResult:
         """Find critical time using PySpark (distributed implementation)."""
         # Get global statistics
@@ -674,7 +678,7 @@ class SurvivalTester:
         
         # Calculate resolution for discretization
         duration_range = max_dur - min_dur
-        resolution = 1.0 if duration_range == 0 else duration_range / 10000
+        resolution = 1.0 if duration_range == 0 else duration_range / bins
         
         # Step 1: Global Discretization
         discretized_df = df.withColumn(
@@ -807,16 +811,17 @@ class SurvivalTester:
         group_col: str = "variant",
         test_type: str = "log_rank",
         alpha: float = 0.05,
+        bins: int = 10000,
     ) -> Dict[str, Any]:
         """Run log-rank test AND critical time analysis in a single call."""
         # Run log-rank test first
         log_rank_result = self.run_test(
-            df, duration_col, event_col, group_col, test_type, alpha
+            df, duration_col, event_col, group_col, test_type, alpha, bins
         )
         
         # Then find critical time
         critical_time_result = self.find_critical_time(
-            df, duration_col, event_col, group_col
+            df, duration_col, event_col, group_col, bins
         )
         
         return {

@@ -52,6 +52,7 @@ class SurvivalEstimator:
         df: Union[pd.DataFrame, SparkDataFrame],
         duration_col: str,
         event_col: str,
+        bins: int = 10000,
         **kwargs,
     ) -> "SurvivalEstimator":
         """Fit the survival estimator to data.
@@ -60,6 +61,7 @@ class SurvivalEstimator:
             df: Input DataFrame (pandas or PySpark).
             duration_col: Name of the duration/time column.
             event_col: Name of the event indicator column (0=censored, 1=event).
+            bins: Number of discretization bins. Default is 10000.
             **kwargs: Additional keyword arguments passed to the backend estimator.
             
         Returns:
@@ -77,7 +79,7 @@ class SurvivalEstimator:
             self._estimator.fit(df, duration_col=duration_col, event_col=event_col, **kwargs)
         elif self.backend == "spark":
             self._estimator = SparkKMFitter()
-            self._estimator.fit(df, duration_col=duration_col, event_col=event_col, **kwargs)
+            self._estimator.fit(df, duration_col=duration_col, event_col=event_col, bins=bins, **kwargs)
         
         self._is_fitted = True
         return self

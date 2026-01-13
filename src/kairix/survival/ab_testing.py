@@ -131,33 +131,6 @@ class SurvivalTester:
     This class implements the log-rank test and Bayesian comparison to evaluate
     differences between two survival curves. It automatically dispatches to the
     appropriate implementation based on the input DataFrame type.
-    
-    The Log-Rank Test:
-        Tests the null hypothesis that there is no difference between the
-        survival curves of two groups. Uses the Z-score formulation:
-        
-        Z = (sum(O1j - E1j)) / sqrt(sum(V1j))
-        
-        Where:
-        - O1j = Observed events in group 1 at time j
-        - E1j = Expected events in group 1 at time j
-        - V1j = Variance at time j
-        
-    The Bayesian Comparison:
-        Uses a Beta-Binomial conjugate model to compute the probability that
-        one group has better survival than another.
-        
-    Example:
-        >>> from kairix.survival import SurvivalTester
-        >>> import pandas as pd
-        >>> df = pd.DataFrame({
-        ...     'tenure': [5, 6, 7, 8, 10, 12, 15, 16],
-        ...     'churned': [1, 0, 1, 0, 1, 1, 1, 0],
-        ...     'variant': ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B']
-        ... })
-        >>> tester = SurvivalTester()
-        >>> result = tester.run_test(df, 'tenure', 'churned', group_col='variant')
-        >>> print(f"P-Value: {result['p_value']:.4f}")
     """
     
     def __init__(self) -> None:
@@ -177,27 +150,7 @@ class SurvivalTester:
         test_type: str = "log_rank",
         alpha: float = 0.05,
     ) -> Dict[str, Any]:
-        """Run a statistical test comparing survival curves between two groups.
-        
-        Args:
-            df: Input DataFrame (pandas or PySpark) containing survival data.
-            duration_col: Name of the column containing duration/time-to-event.
-            event_col: Name of the column containing event indicator (0 or 1).
-            group_col: Name of the column containing group/variant labels.
-            test_type: Type of test to run ('log_rank' or 'wilcoxon'). Default is 'log_rank'.
-            alpha: Significance level. Default is 0.05.
-            
-        Returns:
-            Dictionary containing:
-                - test_statistic: The chi-square test statistic.
-                - p_value: The p-value for the test.
-                - significant: Whether the difference is statistically significant.
-                - summary: Group-level statistics (n_samples, events, etc.).
-                
-        Raises:
-            ValueError: If the group column does not have exactly 2 unique values.
-            TypeError: If df is not a pandas or PySpark DataFrame.
-        """
+        """Run a statistical test comparing survival curves between two groups."""
         # Get unique groups
         if isinstance(df, SparkDataFrame):
             unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
@@ -253,9 +206,9 @@ class SurvivalTester:
         unique_times = np.unique(all_times)
         
         # Calculate observed and expected events, and variance
-        O1_sum = 0.0  # Sum of observed events in group 1
-        E1_sum = 0.0  # Sum of expected events in group 1
-        V1_sum = 0.0  # Sum of variance
+        O1_sum = 0.0
+        E1_sum = 0.0
+        V1_sum = 0.0
         
         for t in unique_times:
             # Events at time t for each group
@@ -272,7 +225,7 @@ class SurvivalTester:
                 # Expected events in group 1 under null hypothesis
                 E1j = Oj * (n1 / Nj)
                 
-                # Variance ( Greenwood's formula variant for two-sample test)
+                # Variance (Greenwood's formula variant for two-sample test)
                 if Nj > 1:
                     V1j = (n1 * n2 * Oj * (Nj - Oj)) / (Nj * Nj * (Nj - 1))
                 else:
@@ -285,7 +238,7 @@ class SurvivalTester:
         # Calculate Z-score
         if V1_sum > 0:
             Z = (O1_sum - E1_sum) / math.sqrt(V1_sum)
-            chi_square = Z * Z  # Chi-square with 1 df
+            chi_square = Z * Z
         else:
             chi_square = 0.0
         
@@ -376,16 +329,13 @@ class SurvivalTester:
         )
         
         # Calculate risk set for each group
-        if row[group_col] == self._group_1_name:
-            agg_df = agg_df.withColumn(
-                "n_at_risk",
-                F.lit(n_1) - F.col("cumulative_observed") + F.col("total_observed")
-            )
-        else:
-            agg_df = agg_df.withColumn(
-                "n_at_risk",
-                F.lit(n_2) - F.col("cumulative_observed") + F.col("total_observed")
-            )
+        # NOTE: Using F.when within the distributed calculation
+        agg_df = agg_df.withColumn(
+            "n_at_risk",
+            F.when(F.col(group_col) == self._group_1_name,
+                   F.lit(n_1) - F.col("cumulative_observed") + F.col("total_observed"))
+            .otherwise(F.lit(n_2) - F.col("cumulative_observed") + F.col("total_observed"))
+        )
         
         # Step 4: Pivot & Statistic (Align groups on same time bin)
         pivot_df = agg_df.groupBy("duration_bin").pivot(
@@ -398,20 +348,26 @@ class SurvivalTester:
         pivot_df = pivot_df.fillna(0)
         
         # Calculate observed and expected events, and variance
+        # FIX: Spark Pivot naming creates {Value}_{Alias}, e.g., Control_d_t
+        col_d_t_1 = F.col(f"{self._group_1_name}_d_t")
+        col_d_t_2 = F.col(f"{self._group_2_name}_d_t")
+        col_n_1 = F.col(f"{self._group_1_name}_n_at_risk")
+        col_n_2 = F.col(f"{self._group_2_name}_n_at_risk")
+
         pivot_df = pivot_df.withColumn(
             "Oj",
-            F.col(f"d_t_{self._group_1_name}") + F.col(f"d_t_{self._group_2_name}")
+            col_d_t_1 + col_d_t_2
         )
         pivot_df = pivot_df.withColumn(
             "Nj",
-            F.col(f"n_at_risk_{self._group_1_name}") + F.col(f"n_at_risk_{self._group_2_name}")
+            col_n_1 + col_n_2
         )
         
         # Expected events for group 1
         pivot_df = pivot_df.withColumn(
             "E1j",
             F.when(F.col("Nj") > 0,
-                   F.col("Oj") * F.col(f"n_at_risk_{self._group_1_name}") / F.col("Nj"))
+                   F.col("Oj") * col_n_1 / F.col("Nj"))
             .otherwise(0)
         )
         
@@ -419,17 +375,15 @@ class SurvivalTester:
         pivot_df = pivot_df.withColumn(
             "V1j",
             F.when(F.col("Nj") > 1,
-                   (F.col(f"n_at_risk_{self._group_1_name}") * 
-                    F.col(f"n_at_risk_{self._group_2_name}") * 
-                    F.col("Oj") * 
-                    (F.col("Nj") - F.col("Oj"))) / 
+                   (col_n_1 * col_n_2 * F.col("Oj") * (F.col("Nj") - F.col("Oj"))) / 
                    (F.col("Nj") * F.col("Nj") * (F.col("Nj") - 1)))
             .otherwise(0)
         )
         
         # Collect results (small dataset)
+        # FIX: Access correct pivot column names
         results = pivot_df.select(
-            f"d_t_{self._group_1_name}",
+            f"{self._group_1_name}_d_t",
             "E1j", "V1j"
         ).collect()
         
@@ -438,7 +392,8 @@ class SurvivalTester:
         V1_sum = 0.0
         
         for row in results:
-            O1_sum += row[f"d_t_{self._group_1_name}"] or 0
+            # FIX: Access correct pivot column names
+            O1_sum += row[f"{self._group_1_name}_d_t"] or 0
             E1_sum += row["E1j"] or 0
             V1_sum += row["V1j"] or 0
         
@@ -479,24 +434,7 @@ class SurvivalTester:
         group_col: str = "variant",
         n_samples: int = 2000,
     ) -> Dict[str, Any]:
-        """Run Bayesian survival comparison using Beta-Binomial conjugate model.
-        
-        This method computes the probability that one group has better survival
-        than another by simulating survival curves from posterior distributions.
-        
-        Args:
-            df: Input DataFrame (pandas or PySpark) containing survival data.
-            duration_col: Name of the column containing duration/time-to-event.
-            event_col: Name of the column containing event indicator (0 or 1).
-            group_col: Name of the column containing group/variant labels.
-            n_samples: Number of posterior samples for Monte Carlo estimation.
-            
-        Returns:
-            Dictionary containing:
-                - prob_superiority: Probability that group 2 > group 1.
-                - credible_intervals: 95% CI for survival at final time.
-                - summary: Group-level statistics.
-        """
+        """Run Bayesian survival comparison using Beta-Binomial conjugate model."""
         # Get unique groups
         if isinstance(df, SparkDataFrame):
             unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
@@ -521,15 +459,12 @@ class SurvivalTester:
             group_2_data = df[df[group_col] == group_2_label]
         
         # Calculate hazard rates per time bin using KM-like approach
-        # For simplicity, we use the overall event rate per group
         n1 = len(group_1_data)
         n2 = len(group_2_data)
         events1 = group_1_data[event_col].sum()
         events2 = group_2_data[event_col].sum()
         
         # Posterior hazard rates (Beta-Binomial conjugate)
-        # Prior: Beta(1, 1) - uninformative
-        # Posterior: Beta(1 + events, 1 + (n - events))
         alpha1_prior, beta1_prior = 1, 1
         alpha2_prior, beta2_prior = 1, 1
         
@@ -543,7 +478,7 @@ class SurvivalTester:
         hazard_samples1 = np.random.beta(alpha1_post, beta1_post, n_samples)
         hazard_samples2 = np.random.beta(alpha2_post, beta2_post, n_samples)
         
-        # Survival at final time (simplified: S = (1 - h)^t where t is max duration)
+        # Survival at final time (simplified)
         max_duration = max(group_1_data[duration_col].max(), group_2_data[duration_col].max())
         
         survival1 = (1 - hazard_samples1) ** max_duration
@@ -586,27 +521,7 @@ class SurvivalTester:
         event_col: str,
         group_col: str = "variant",
     ) -> CriticalTimeResult:
-        """Find the critical time when the largest difference between groups occurs.
-        
-        This method identifies two key time points:
-        1. Cumulative max: When the running cumulative difference (O - E) is maximized
-        2. Per-timepoint max: When the individual time point contribution is maximized
-        
-        Args:
-            df: Input DataFrame (pandas or PySpark) containing survival data.
-            duration_col: Name of the column containing duration/time-to-event.
-            event_col: Name of the column containing event indicator (0 or 1).
-            group_col: Name of the column containing group/variant labels.
-            
-        Returns:
-            CriticalTimeResult containing:
-                - cumulative_max_time: Time when groups diverge most
-                - per_timepoint_max_time: Time of largest single difference
-                - timeline and difference arrays for visualization
-        
-        Raises:
-            ValueError: If the group column does not have exactly 2 unique values.
-        """
+        """Find the critical time when the largest difference between groups occurs."""
         # Get unique groups
         if isinstance(df, SparkDataFrame):
             unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
@@ -801,24 +716,30 @@ class SurvivalTester:
         
         pivot_df = pivot_df.fillna(0)
         
+        # FIX: Spark Pivot naming creates {Value}_{Alias}, e.g., Control_d_t
+        col_d_t_1 = F.col(f"{group_1_name}_d_t")
+        col_d_t_2 = F.col(f"{group_2_name}_d_t")
+        col_n_1 = F.col(f"{group_1_name}_n_at_risk")
+        col_n_2 = F.col(f"{group_2_name}_n_at_risk")
+
         # Calculate Oj, Nj, and per-timepoint difference (O1 - E1)
         pivot_df = pivot_df.withColumn(
             "Oj",
-            F.col(f"d_t_{group_1_name}") + F.col(f"d_t_{group_2_name}")
+            col_d_t_1 + col_d_t_2
         )
         pivot_df = pivot_df.withColumn(
             "Nj",
-            F.col(f"n_at_risk_{group_1_name}") + F.col(f"n_at_risk_{group_2_name}")
+            col_n_1 + col_n_2
         )
         pivot_df = pivot_df.withColumn(
             "E1j",
             F.when(F.col("Nj") > 0,
-                   F.col("Oj") * F.col(f"n_at_risk_{group_1_name}") / F.col("Nj"))
+                   F.col("Oj") * col_n_1 / F.col("Nj"))
             .otherwise(0)
         )
         pivot_df = pivot_df.withColumn(
             "per_timepoint_diff",
-            F.col(f"d_t_{group_1_name}") - F.col("E1j")
+            col_d_t_1 - F.col("E1j")
         )
         
         # Collect results
@@ -887,25 +808,7 @@ class SurvivalTester:
         test_type: str = "log_rank",
         alpha: float = 0.05,
     ) -> Dict[str, Any]:
-        """Run log-rank test AND critical time analysis in a single call.
-        
-        This is a convenience method that combines run_test() and find_critical_time()
-        to provide both statistical significance and temporal insight in one call.
-        
-        Args:
-            df: Input DataFrame (pandas or PySpark) containing survival data.
-            duration_col: Name of the column containing duration/time-to-event.
-            event_col: Name of the column containing event indicator (0 or 1).
-            group_col: Name of the column containing group/variant labels.
-            test_type: Type of test to run ('log_rank' or 'wilcoxon'). Default is 'log_rank'.
-            alpha: Significance level. Default is 0.05.
-            
-        Returns:
-            Dictionary containing:
-                - log_rank_result: Standard log-rank test results (test_statistic, p_value, significant)
-                - critical_time: CriticalTimeResult with both metrics
-                - summary: Group-level statistics (n_samples, events, etc.)
-        """
+        """Run log-rank test AND critical time analysis in a single call."""
         # Run log-rank test first
         log_rank_result = self.run_test(
             df, duration_col, event_col, group_col, test_type, alpha
@@ -928,11 +831,7 @@ class SurvivalTester:
         }
     
     def summary(self) -> Dict[str, Any]:
-        """Get a summary of the test results.
-        
-        Returns:
-            Dictionary containing test statistics and group metrics.
-        """
+        """Get a summary of the test results."""
         if not self._is_fitted:
             raise ValueError("Test has not been run. Call run_test() first.")
         

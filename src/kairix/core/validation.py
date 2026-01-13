@@ -31,7 +31,7 @@ def validate_input_schema(
 
     # Validate duration column type (numeric)
     duration_dtype = df.schema[duration_col].dataType
-    if not isinstance(dtype, (DoubleType, IntegerType, LongType, FloatType)):
+    if not isinstance(duration_dtype, (DoubleType, IntegerType, LongType, FloatType)):
         raise ValueError(
             f"Duration column '{duration_col}' must be numeric (DoubleType or IntegerType), "
             f"found {duration_dtype}"

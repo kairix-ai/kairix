@@ -3,3 +3,16 @@
 
 # Ignore all Jupyter Notebook files
 *.ipynb
+
+# Ignore .vscode directory
+
+.vscode/
+
+# Ignore __pycache__ in all directories
+**/__pycache__/
+
+# Ignore .pyc files
+**/*.pyc
+
+# Ignore .gitignore file
+.gitignore

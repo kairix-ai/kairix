@@ -32,7 +32,7 @@ Example:
 from kairix.survival.estimator import SurvivalEstimator
 from kairix.survival.local_impl import KaplanMeierFitter
 from kairix.survival.spark_impl import KaplanMeier
-from kairix.survival.ab_testing import SurvivalTester, LogRankResult, BayesianResult
+from kairix.survival.ab_testing import SurvivalTester, LogRankResult, BayesianResult, CriticalTimeResult
 
 __all__ = [
     "SurvivalEstimator",  # Unified interface
@@ -41,4 +41,5 @@ __all__ = [
     "SurvivalTester",     # A/B Testing for survival analysis
     "LogRankResult",      # Log-rank test result dataclass
     "BayesianResult",     # Bayesian comparison result dataclass
+    "CriticalTimeResult", # Critical time analysis result dataclass
 ]

@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
-from kairix.survival import SurvivalTester, LogRankResult
+from kairix.survival import SurvivalTester, LogRankResult, CriticalTimeResult
 
 
 class TestLogRankResult:
@@ -417,6 +417,285 @@ class TestBayesianComparison:
         summary = tester.summary()
         assert 'n_group_1' in summary
         assert 'n_group_2' in summary
+
+
+class TestCriticalTimeResult:
+    """Tests for CriticalTimeResult dataclass."""
+    
+    def test_to_dict(self):
+        """Test conversion to dictionary."""
+        result = CriticalTimeResult(
+            cumulative_max_time=7.0,
+            cumulative_max_difference=2.3,
+            cumulative_max_direction="treatment_better",
+            per_timepoint_max_time=3.0,
+            per_timepoint_max_difference=1.8,
+            per_timepoint_max_direction="treatment_better",
+            timeline=[1.0, 2.0, 3.0, 4.0, 5.0],
+            cumulative_differences=[0.1, 0.5, 1.2, 1.8, 2.3],
+            per_timepoint_differences=[0.1, 0.4, 0.7, 0.6, 0.5],
+            group_1_name="control",
+            group_2_name="treatment",
+        )
+        
+        result_dict = result.to_dict()
+        
+        assert result_dict["cumulative_max_time"] == 7.0
+        assert result_dict["cumulative_max_difference"] == 2.3
+        assert result_dict["cumulative_max_direction"] == "treatment_better"
+        assert result_dict["per_timepoint_max_time"] == 3.0
+        assert result_dict["per_timepoint_max_difference"] == 1.8
+        assert result_dict["timeline"] == [1.0, 2.0, 3.0, 4.0, 5.0]
+        assert len(result_dict["cumulative_differences"]) == 5
+
+
+class TestCriticalTimePandas:
+    """Tests for critical time detection with pandas DataFrames."""
+    
+    def test_find_critical_time_basic(self):
+        """Test basic critical time detection."""
+        df = pd.DataFrame({
+            'duration': [5, 6, 7, 8, 10, 12, 15, 16],
+            'event': [1, 0, 1, 0, 1, 1, 1, 0],
+            'variant': ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B'],
+        })
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
+        
+        # Should return a valid CriticalTimeResult
+        assert isinstance(result, CriticalTimeResult)
+        assert result.cumulative_max_time >= 0
+        assert result.per_timepoint_max_time >= 0
+        assert len(result.timeline) > 0
+        assert len(result.cumulative_differences) == len(result.timeline)
+        assert len(result.per_timepoint_differences) == len(result.timeline)
+    
+    def test_find_critical_time_identical_groups(self):
+        """Test critical time with identical groups."""
+        # Create identical survival distributions
+        np.random.seed(42)
+        n = 50
+        
+        control_duration = np.random.exponential(10, n)
+        control_duration = np.clip(control_duration, 0.1, 100).round(1)
+        control_event = np.random.binomial(1, 0.7, n)
+        
+        treatment_duration = np.random.exponential(10, n)
+        treatment_duration = np.clip(treatment_duration, 0.1, 100).round(1)
+        treatment_event = np.random.binomial(1, 0.7, n)
+        
+        df = pd.DataFrame({
+            'duration': np.concatenate([control_duration, treatment_duration]),
+            'event': np.concatenate([control_event, treatment_event]),
+            'variant': ['A'] * n + ['B'] * n,
+        })
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
+        
+        # With identical groups, the max difference should be small
+        assert abs(result.cumulative_max_difference) < 5.0  # Relatively small
+    
+    def test_find_critical_time_different_groups(self):
+        """Test critical time with different survival distributions."""
+        # Create two groups with different survival distributions
+        np.random.seed(42)
+        n = 100
+        
+        # Control: faster churn (earlier events)
+        control_duration = np.random.exponential(5, n)
+        control_duration = np.clip(control_duration, 0.1, 50).round(1)
+        control_event = np.random.binomial(1, 0.6, n)
+        
+        # Treatment: slower churn (later events)
+        treatment_duration = np.random.exponential(15, n)
+        treatment_duration = np.clip(treatment_duration, 0.1, 50).round(1)
+        treatment_event = np.random.binomial(1, 0.6, n)
+        
+        df = pd.DataFrame({
+            'duration': np.concatenate([control_duration, treatment_duration]),
+            'event': np.concatenate([control_event, treatment_event]),
+            'variant': ['A'] * n + ['B'] * n,
+        })
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
+        
+        # Direction should indicate control (A) has worse survival (more events)
+        assert result.cumulative_max_direction in ['A_better', 'B_better']
+        # Timeline should be sorted
+        assert result.timeline == sorted(result.timeline)
+    
+    def test_find_critical_time_all_censored(self):
+        """Test critical time with all censored events."""
+        df = pd.DataFrame({
+            'duration': [5, 6, 7, 8, 10, 12],
+            'event': [0, 0, 0, 0, 0, 0],  # All censored
+            'variant': ['A', 'A', 'A', 'B', 'B', 'B'],
+        })
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
+        
+        # With no events, differences should be zero
+        assert result.cumulative_max_difference == 0.0
+        assert result.per_timepoint_max_difference == 0.0
+    
+    def test_run_test_with_critical_time(self):
+        """Test the combined run_test_with_critical_time method."""
+        df = pd.DataFrame({
+            'duration': [5, 6, 7, 8, 10, 12, 15, 16],
+            'event': [1, 0, 1, 0, 1, 1, 1, 0],
+            'variant': ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B'],
+        })
+        
+        tester = SurvivalTester()
+        result = tester.run_test_with_critical_time(df, 'duration', 'event', group_col='variant')
+        
+        # Should return both log_rank_result and critical_time
+        assert 'log_rank_result' in result
+        assert 'critical_time' in result
+        assert 'summary' in result
+        
+        # Check log_rank_result structure
+        assert 'test_statistic' in result['log_rank_result']
+        assert 'p_value' in result['log_rank_result']
+        assert 'significant' in result['log_rank_result']
+        
+        # Check critical_time structure
+        assert 'cumulative_max_time' in result['critical_time']
+        assert 'per_timepoint_max_time' in result['critical_time']
+        assert 'timeline' in result['critical_time']
+        
+        # Check summary structure
+        assert 'n_group_1' in result['summary']
+        assert 'n_group_2' in result['summary']
+
+
+class TestCriticalTimeSpark:
+    """Tests for critical time detection with PySpark DataFrames."""
+    
+    @pytest.fixture
+    def spark_session(self):
+        """Create a Spark session for testing."""
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder \
+            .appName("test_critical_time") \
+            .master("local[2]") \
+            .getOrCreate()
+        yield spark
+        spark.stop()
+    
+    def test_find_critical_time_spark_basic(self, spark_session):
+        """Test basic critical time detection with Spark."""
+        data = pd.DataFrame({
+            'duration': [5, 6, 7, 8, 10, 12, 15, 16],
+            'event': [1, 0, 1, 0, 1, 1, 1, 0],
+            'variant': ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B'],
+        })
+        
+        spark_df = spark_session.createDataFrame(data)
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(spark_df, 'duration', 'event', group_col='variant')
+        
+        # Should return a valid CriticalTimeResult
+        assert isinstance(result, CriticalTimeResult)
+        assert result.cumulative_max_time >= 0
+        assert result.per_timepoint_max_time >= 0
+        assert len(result.timeline) > 0
+    
+    def test_find_critical_time_spark_identical_groups(self, spark_session):
+        """Test critical time with Spark when groups are identical."""
+        np.random.seed(42)
+        n = 50
+        
+        control_duration = np.random.exponential(10, n)
+        control_duration = np.clip(control_duration, 0.1, 100).round(1)
+        control_event = np.random.binomial(1, 0.7, n)
+        
+        treatment_duration = np.random.exponential(10, n)
+        treatment_duration = np.clip(treatment_duration, 0.1, 100).round(1)
+        treatment_event = np.random.binomial(1, 0.7, n)
+        
+        data = pd.DataFrame({
+            'duration': np.concatenate([control_duration, treatment_duration]),
+            'event': np.concatenate([control_event, treatment_event]),
+            'variant': ['A'] * n + ['B'] * n,
+        })
+        
+        spark_df = spark_session.createDataFrame(data)
+        
+        tester = SurvivalTester()
+        result = tester.find_critical_time(spark_df, 'duration', 'event', group_col='variant')
+        
+        # With identical groups, the max difference should be small
+        assert abs(result.cumulative_max_difference) < 5.0
+    
+    def test_run_test_with_critical_time_spark(self, spark_session):
+        """Test run_test_with_critical_time with Spark."""
+        data = pd.DataFrame({
+            'duration': [5, 6, 7, 8, 10, 12, 15, 16],
+            'event': [1, 0, 1, 0, 1, 1, 1, 0],
+            'variant': ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B'],
+        })
+        
+        spark_df = spark_session.createDataFrame(data)
+        
+        tester = SurvivalTester()
+        result = tester.run_test_with_critical_time(spark_df, 'duration', 'event', group_col='variant')
+        
+        # Should return both log_rank_result and critical_time
+        assert 'log_rank_result' in result
+        assert 'critical_time' in result
+        assert 'summary' in result
+        
+        # Check log_rank_result structure
+        assert 'test_statistic' in result['log_rank_result']
+        assert 'p_value' in result['log_rank_result']
+        
+        # Check critical_time structure
+        assert 'cumulative_max_time' in result['critical_time']
+        assert 'per_timepoint_max_time' in result['critical_time']
+    
+    def test_critical_time_spark_pandas_consistency(self, spark_session):
+        """Test that Spark and pandas give consistent critical time results."""
+        np.random.seed(42)
+        n = 100
+        
+        control_duration = np.random.exponential(10, n)
+        control_duration = np.clip(control_duration, 0.1, 100).round(1)
+        control_event = np.random.binomial(1, 0.6, n)
+        
+        treatment_duration = np.random.exponential(12, n)
+        treatment_duration = np.clip(treatment_duration, 0.1, 100).round(1)
+        treatment_event = np.random.binomial(1, 0.6, n)
+        
+        data = pd.DataFrame({
+            'duration': np.concatenate([control_duration, treatment_duration]),
+            'event': np.concatenate([control_event, treatment_event]),
+            'variant': ['A'] * n + ['B'] * n,
+        })
+        
+        # Test with pandas
+        pandas_tester = SurvivalTester()
+        pandas_result = pandas_tester.find_critical_time(
+            data, duration_col='duration', event_col='event', group_col='variant'
+        )
+        
+        # Test with Spark
+        spark_df = spark_session.createDataFrame(data)
+        spark_tester = SurvivalTester()
+        spark_result = spark_tester.find_critical_time(
+            spark_df, duration_col='duration', event_col='event', group_col='variant'
+        )
+        
+        # Cumulative max time should be similar (within binning tolerance)
+        assert abs(pandas_result.cumulative_max_time - spark_result.cumulative_max_time) < 10
+        
+        # Direction should match
+        assert pandas_result.cumulative_max_direction == spark_result.cumulative_max_direction
 
 
 if __name__ == "__main__":

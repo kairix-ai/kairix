@@ -297,6 +297,9 @@ class SurvivalTester:
             else:
                 group_2_stats = row
         
+        if not group_1_stats or not group_2_stats:
+             raise ValueError("One or both groups have no data.")
+
         n_1 = group_1_stats["n_samples"]
         n_2 = group_2_stats["n_samples"]
         events_1 = group_1_stats["total_events"]
@@ -320,37 +323,45 @@ class SurvivalTester:
             F.count(F.lit(1)).alias("total_observed"),  # Total at risk at this time
         )
         
-        # Step 3: Risk Set Calculation (Window)
-        window_spec = Window.partitionBy(group_col).orderBy("duration_bin").rowsBetween(
-            Window.unboundedPreceding, Window.currentRow
-        )
-        
-        agg_df = agg_df.withColumn(
-            "cumulative_observed",
-            F.sum("total_observed").over(window_spec),
-        )
-        
-        # Calculate risk set for each group
-        # NOTE: Using F.when within the distributed calculation
-        agg_df = agg_df.withColumn(
-            "n_at_risk",
-            F.when(F.col(group_col) == self._group_1_name,
-                   F.lit(n_1) - F.col("cumulative_observed") + F.col("total_observed"))
-            .otherwise(F.lit(n_2) - F.col("cumulative_observed") + F.col("total_observed"))
-        )
-        
-        # Step 4: Pivot & Statistic (Align groups on same time bin)
+        # === FIX: EARLY PIVOT ===
+        # Pivot counts first to align time bins. Fill missing activity with 0.
         pivot_df = agg_df.groupBy("duration_bin").pivot(
             group_col, values=[self._group_1_name, self._group_2_name]
         ).agg(
             F.first("d_t").alias("d_t"),
-            F.first("n_at_risk").alias("n_at_risk"),
+            F.first("total_observed").alias("total_observed")
+        ).fillna(0)
+        
+        # Step 3: Risk Set Calculation (Window) on ALIGNED data
+        # Now we can safely calculate risk sets because missing bins are 0-filled,
+        # allowing the cumulative sum to "hold" the previous value.
+        window_spec = Window.orderBy("duration_bin").rowsBetween(
+            Window.unboundedPreceding, Window.currentRow
         )
         
-        pivot_df = pivot_df.fillna(0)
+        # Logic: Risk = Total_N - (Cumulative_Observed_Up_To_Here) + (Observed_In_Current_Bin)
         
-        # Calculate observed and expected events, and variance
-        # FIX: Spark Pivot naming creates {Value}_{Alias}, e.g., Control_d_t
+        # Group 1 Risk Set
+        pivot_df = pivot_df.withColumn(
+            f"{self._group_1_name}_cumulative",
+            F.sum(f"{self._group_1_name}_total_observed").over(window_spec)
+        )
+        pivot_df = pivot_df.withColumn(
+            f"{self._group_1_name}_n_at_risk",
+            F.lit(n_1) - F.col(f"{self._group_1_name}_cumulative") + F.col(f"{self._group_1_name}_total_observed")
+        )
+        
+        # Group 2 Risk Set
+        pivot_df = pivot_df.withColumn(
+            f"{self._group_2_name}_cumulative",
+            F.sum(f"{self._group_2_name}_total_observed").over(window_spec)
+        )
+        pivot_df = pivot_df.withColumn(
+            f"{self._group_2_name}_n_at_risk",
+            F.lit(n_2) - F.col(f"{self._group_2_name}_cumulative") + F.col(f"{self._group_2_name}_total_observed")
+        )
+        
+        # Step 4: Statistic Calculation
         col_d_t_1 = F.col(f"{self._group_1_name}_d_t")
         col_d_t_2 = F.col(f"{self._group_2_name}_d_t")
         col_n_1 = F.col(f"{self._group_1_name}_n_at_risk")
@@ -382,8 +393,7 @@ class SurvivalTester:
             .otherwise(0)
         )
         
-        # Collect results (small dataset)
-        # FIX: Access correct pivot column names
+        # Collect results
         results = pivot_df.select(
             f"{self._group_1_name}_d_t",
             "E1j", "V1j"
@@ -394,7 +404,6 @@ class SurvivalTester:
         V1_sum = 0.0
         
         for row in results:
-            # FIX: Access correct pivot column names
             O1_sum += row[f"{self._group_1_name}_d_t"] or 0
             E1_sum += row["E1j"] or 0
             V1_sum += row["V1j"] or 0

@@ -660,158 +660,147 @@ class SurvivalTester:
         group_2_name: str,
         bins: int = 10000,
     ) -> CriticalTimeResult:
-        """Find critical time using PySpark (distributed implementation)."""
-        # Get global statistics
+        """Find critical time using PySpark with EARLY PIVOT stability."""
+        
+        # --- 1. Global Stats ---
         stats_row = df.groupBy(group_col).agg(
             F.count(F.lit(1)).alias("n_samples"),
-            F.sum(event_col).alias("total_events"),
             F.min(duration_col).alias("min_duration"),
             F.max(duration_col).alias("max_duration"),
         ).collect()
         
-        # Extract stats for each group
-        group_1_stats = None
-        group_2_stats = None
-        for row in stats_row:
-            if row[group_col] == group_1_name:
-                group_1_stats = row
-            else:
-                group_2_stats = row
+        group_1_stats = next(r for r in stats_row if r[group_col] == group_1_name)
+        group_2_stats = next(r for r in stats_row if r[group_col] == group_2_name)
         
         n_1 = group_1_stats["n_samples"]
         n_2 = group_2_stats["n_samples"]
-        events_1 = group_1_stats["total_events"]
-        events_2 = group_2_stats["total_events"]
         min_dur = min(group_1_stats["min_duration"], group_2_stats["min_duration"])
         max_dur = max(group_1_stats["max_duration"], group_2_stats["max_duration"])
         
-        # Calculate resolution for discretization
+        # Resolution
         duration_range = max_dur - min_dur
         resolution = 1.0 if duration_range == 0 else duration_range / bins
         
-        # Step 1: Global Discretization
+        # --- 2. Discretize & Aggregate ---
         discretized_df = df.withColumn(
             "duration_bin",
             (F.floor(F.col(duration_col) / resolution) * resolution).cast("double"),
         )
         
-        # Step 2: Aggregation - Group by bin AND group
         agg_df = discretized_df.groupBy("duration_bin", group_col).agg(
             F.sum(event_col).alias("d_t"),
             F.count(F.lit(1)).alias("total_observed"),
         )
         
-        # Step 3: Risk Set Calculation
-        window_spec = Window.partitionBy(group_col).orderBy("duration_bin").rowsBetween(
-            Window.unboundedPreceding, Window.currentRow
-        )
-        
-        agg_df = agg_df.withColumn(
-            "cumulative_observed",
-            F.sum("total_observed").over(window_spec),
-        )
-        
-        # Calculate risk set for each group
-        agg_df = agg_df.withColumn(
-            "n_at_risk",
-            F.when(F.col(group_col) == group_1_name,
-                   F.lit(n_1) - F.col("cumulative_observed") + F.col("total_observed"))
-            .otherwise(F.lit(n_2) - F.col("cumulative_observed") + F.col("total_observed"))
-        )
-        
-        # Step 4: Pivot & Calculate per-timepoint difference
+        # --- 3. EARLY PIVOT (The Fix for Sparse Bins) ---
         pivot_df = agg_df.groupBy("duration_bin").pivot(
             group_col, values=[group_1_name, group_2_name]
         ).agg(
             F.first("d_t").alias("d_t"),
-            F.first("n_at_risk").alias("n_at_risk"),
+            F.first("total_observed").alias("total_observed")
+        ).fillna(0)
+        
+        # --- 4. Calculate Risk Sets on ALIGNED Data ---
+        window_spec = Window.orderBy("duration_bin").rowsBetween(
+            Window.unboundedPreceding, Window.currentRow
         )
         
-        pivot_df = pivot_df.fillna(0)
+        # Group 1 (Control) Risk Set
+        pivot_df = pivot_df.withColumn(
+            f"{group_1_name}_cum_obs", 
+            F.sum(f"{group_1_name}_total_observed").over(window_spec)
+        )
+        pivot_df = pivot_df.withColumn(
+            f"{group_1_name}_n_at_risk",
+            F.lit(n_1) - F.col(f"{group_1_name}_cum_obs") + F.col(f"{group_1_name}_total_observed")
+        )
+
+        # Group 2 (Treatment) Risk Set
+        pivot_df = pivot_df.withColumn(
+            f"{group_2_name}_cum_obs", 
+            F.sum(f"{group_2_name}_total_observed").over(window_spec)
+        )
+        pivot_df = pivot_df.withColumn(
+            f"{group_2_name}_n_at_risk",
+            F.lit(n_2) - F.col(f"{group_2_name}_cum_obs") + F.col(f"{group_2_name}_total_observed")
+        )
         
-        # FIX: Spark Pivot naming creates {Value}_{Alias}, e.g., Control_d_t
+        # --- 5. Calculate Divergence (O - E) ---
         col_d_t_1 = F.col(f"{group_1_name}_d_t")
         col_d_t_2 = F.col(f"{group_2_name}_d_t")
         col_n_1 = F.col(f"{group_1_name}_n_at_risk")
         col_n_2 = F.col(f"{group_2_name}_n_at_risk")
 
-        # Calculate Oj, Nj, and per-timepoint difference (O1 - E1)
-        pivot_df = pivot_df.withColumn(
-            "Oj",
-            col_d_t_1 + col_d_t_2
-        )
-        pivot_df = pivot_df.withColumn(
-            "Nj",
-            col_n_1 + col_n_2
-        )
+        pivot_df = pivot_df.withColumn("Oj", col_d_t_1 + col_d_t_2)
+        pivot_df = pivot_df.withColumn("Nj", col_n_1 + col_n_2)
+        
+        # Expected events for Group 1 (Control)
         pivot_df = pivot_df.withColumn(
             "E1j",
-            F.when(F.col("Nj") > 0,
-                   F.col("Oj") * col_n_1 / F.col("Nj"))
-            .otherwise(0)
-        )
-        pivot_df = pivot_df.withColumn(
-            "per_timepoint_diff",
-            col_d_t_1 - F.col("E1j")
+            F.when(F.col("Nj") > 0, F.col("Oj") * col_n_1 / F.col("Nj")).otherwise(0)
         )
         
-        # Collect results
-        results = pivot_df.select(
-            "duration_bin",
-            "per_timepoint_diff"
-        ).orderBy("duration_bin").collect()
+        # Diff = Observed_Control - Expected_Control
+        # Positive Diff => Control has EXCESS events (Dying faster) => Treatment is BETTER
+        pivot_df = pivot_df.withColumn("diff", col_d_t_1 - F.col("E1j"))
         
-        # Calculate cumulative differences and find max
+        # Collect results sorted by time
+        results = pivot_df.select("duration_bin", "diff").orderBy("duration_bin").collect()
+        
+        # --- 6. Python-side Trajectory Analysis ---
         timeline = []
         per_timepoint_diffs = []
         cumulative_diffs = []
         cumulative_sum = 0.0
         
         for row in results:
-            timeline.append(float(row["duration_bin"]))
-            diff = float(row["per_timepoint_diff"]) if row["per_timepoint_diff"] else 0.0
+            t = float(row["duration_bin"])
+            diff = float(row["diff"])
+            
+            timeline.append(t)
             per_timepoint_diffs.append(diff)
+            
             cumulative_sum += diff
             cumulative_diffs.append(cumulative_sum)
+            
+        # --- 7. Metrics & Direction Fix ---
         
-        # Find cumulative max
+        # Cumulative Max (Point of Maximum Total Impact)
         cum_max_idx = np.argmax(np.abs(cumulative_diffs)) if cumulative_diffs else 0
-        cumulative_max_time = timeline[cum_max_idx] if timeline else 0.0
-        cumulative_max_diff = cumulative_diffs[cum_max_idx] if cumulative_diffs else 0.0
-        cumulative_max_direction = (
-            f"{group_2_name}_better" if cumulative_max_diff < 0 else f"{group_1_name}_better"
-        )
+        cum_max_time = timeline[cum_max_idx] if timeline else 0.0
+        cum_max_val = cumulative_diffs[cum_max_idx] if cumulative_diffs else 0.0
         
-        # Find per-timepoint max
+        # FIX: Direction Logic
+        # If Cumulative Diff > 0 => Control Events > Expected => Control Worse => Treatment Better
+        if cum_max_val > 0:
+            cum_direction = f"{group_2_name}_better" # Treatment Better
+        else:
+            cum_direction = f"{group_1_name}_better" # Control Better
+
+        # Per-Timepoint Max (Point of Maximum Instantaneous Divergence)
         pt_max_idx = np.argmax(np.abs(per_timepoint_diffs)) if per_timepoint_diffs else 0
-        per_timepoint_max_time = timeline[pt_max_idx] if timeline else 0.0
-        per_timepoint_max_diff = per_timepoint_diffs[pt_max_idx] if per_timepoint_diffs else 0.0
-        per_timepoint_max_direction = (
-            f"{group_2_name}_better" if per_timepoint_max_diff < 0 else f"{group_1_name}_better"
-        )
+        pt_max_time = timeline[pt_max_idx] if timeline else 0.0
+        pt_max_val = per_timepoint_diffs[pt_max_idx] if per_timepoint_diffs else 0.0
         
-        # Store stats
-        self._stats = {
-            "n_group_1": n_1,
-            "n_group_2": n_2,
-            "events_group_1": int(events_1),
-            "events_group_2": int(events_2),
-        }
-        
+        if pt_max_val > 0:
+            pt_direction = f"{group_2_name}_better"
+        else:
+            pt_direction = f"{group_1_name}_better"
+
         return CriticalTimeResult(
-            cumulative_max_time=cumulative_max_time,
-            cumulative_max_difference=cumulative_max_diff,
-            cumulative_max_direction=cumulative_max_direction,
-            per_timepoint_max_time=per_timepoint_max_time,
-            per_timepoint_max_difference=per_timepoint_max_diff,
-            per_timepoint_max_direction=per_timepoint_max_direction,
+            cumulative_max_time=cum_max_time,
+            cumulative_max_difference=cum_max_val,
+            cumulative_max_direction=cum_direction,
+            per_timepoint_max_time=pt_max_time,
+            per_timepoint_max_difference=pt_max_val,
+            per_timepoint_max_direction=pt_direction,
             timeline=timeline,
             cumulative_differences=cumulative_diffs,
             per_timepoint_differences=per_timepoint_diffs,
             group_1_name=group_1_name,
             group_2_name=group_2_name,
         )
-    
+
     def run_test_with_critical_time(
         self,
         df: Union[pd.DataFrame, SparkDataFrame],

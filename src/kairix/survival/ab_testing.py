@@ -1,12 +1,10 @@
-"""A/B Testing for Survival Analysis using Log-Rank Test.
+"""A/B Testing for Survival Analysis (Fixed Directionality & Scale).
 
-This module provides functionality to compare survival curves between two groups
-using the log-rank test and Bayesian inference. It follows the Kairix
-"Inference Matrix" pattern that decouples statistical methods from compute backends.
-
-The Dispatcher Pattern:
-    SurvivalTester detects input DataFrame type (pandas or Spark) and routes
-    execution to the appropriate implementation strategy.
+This module implements the "Inference Matrix" pattern:
+1. Dispatcher: Routes to Pandas (Local) or Spark (Distributed).
+2. Logic: Uses "Excess Events" (Observed - Expected) to track treatment effect.
+    - Positive Value: Treatment is WORSE (dying faster than expected).
+    - Negative Value: Treatment is BETTER (surviving longer than expected).
 """
 
 from typing import Optional, Dict, Any, Union, Tuple, List
@@ -32,8 +30,8 @@ class LogRankResult:
         p_value: The p-value for the test (two-sided).
         degrees_of_freedom: Degrees of freedom (always 1 for comparing 2 groups).
         significant: Whether the difference is statistically significant at alpha=0.05.
-        group_1_name: Name of the first group.
-        group_2_name: Name of the second group.
+        group_1_name: Name of the first group (Control).
+        group_2_name: Name of the second group (Treatment).
     """
     test_statistic: float
     p_value: float
@@ -78,33 +76,18 @@ class BayesianResult:
 
 @dataclass
 class CriticalTimeResult:
-    """Result of critical time analysis for survival curve comparison.
+    """Result of critical time analysis tracking Treatment Deviation.
     
-    This identifies when the largest difference between two survival curves occurs,
-    which is useful for understanding when treatment effects are most pronounced.
-    
-    Attributes:
-        cumulative_max_time: Time when cumulative difference between groups is maximized.
-        cumulative_max_difference: Value of maximum cumulative difference (O - E).
-        cumulative_max_direction: Direction of maximum difference ("treatment_better" or "control_better").
-        per_timepoint_max_time: Time when per-timepoint difference is maximized.
-        per_timepoint_max_difference: Value of maximum per-timepoint difference.
-        per_timepoint_max_direction: Direction of max per-timepoint difference.
-        timeline: List of all time points analyzed.
-        cumulative_differences: Cumulative (O - E) at each time point.
-        per_timepoint_differences: Per-timepoint (O - E) at each time point.
-        group_1_name: Name of the first group (control).
-        group_2_name: Name of the second group (treatment).
+    Metric: (Observed_Group2 - Expected_Group2)
+    - Positive Value (> 0): Group 2 has EXCESS events (Performing Worse).
+    - Negative Value (< 0): Group 2 has FEWER events (Performing Better).
     """
     cumulative_max_time: float
-    cumulative_max_difference: float
-    cumulative_max_direction: str
-    per_timepoint_max_time: float
-    per_timepoint_max_difference: float
-    per_timepoint_max_direction: str
+    cumulative_max_excess: float  
+    crossover_time: Optional[float] 
     timeline: List[float]
-    cumulative_differences: List[float]
-    per_timepoint_differences: List[float]
+    cumulative_excess_events: List[float]
+    per_timepoint_excess: List[float]
     group_1_name: str = "control"
     group_2_name: str = "treatment"
     
@@ -112,14 +95,11 @@ class CriticalTimeResult:
         """Convert result to dictionary."""
         return {
             "cumulative_max_time": self.cumulative_max_time,
-            "cumulative_max_difference": self.cumulative_max_difference,
-            "cumulative_max_direction": self.cumulative_max_direction,
-            "per_timepoint_max_time": self.per_timepoint_max_time,
-            "per_timepoint_max_difference": self.per_timepoint_max_difference,
-            "per_timepoint_max_direction": self.per_timepoint_max_direction,
+            "cumulative_max_excess": self.cumulative_max_excess,
+            "crossover_time": self.crossover_time,
             "timeline": self.timeline,
-            "cumulative_differences": self.cumulative_differences,
-            "per_timepoint_differences": self.per_timepoint_differences,
+            "cumulative_excess_events": self.cumulative_excess_events,
+            "per_timepoint_excess": self.per_timepoint_excess,
             "group_1_name": self.group_1_name,
             "group_2_name": self.group_2_name,
         }
@@ -149,7 +129,7 @@ class SurvivalTester:
         group_col: str = "variant",
         test_type: str = "log_rank",
         alpha: float = 0.05,
-        bins: int = 10000,
+        bins: int = 100000, 
     ) -> Dict[str, Any]:
         """Run a statistical test comparing survival curves between two groups."""
         # Get unique groups
@@ -158,6 +138,7 @@ class SurvivalTester:
         else:
             unique_groups = df[group_col].unique().tolist()
         
+        unique_groups.sort() # Ensure consistency
         if len(unique_groups) != 2:
             raise ValueError(
                 f"Group column must have exactly 2 unique values, "
@@ -252,9 +233,6 @@ class SurvivalTester:
             "n_group_2": len(group_2_data),
             "events_group_1": e1.sum(),
             "events_group_2": e2.sum(),
-            "observed_1": O1_sum,
-            "expected_1": E1_sum,
-            "variance": V1_sum,
         }
         
         return LogRankResult(
@@ -274,7 +252,7 @@ class SurvivalTester:
         group_col: str,
         test_type: str,
         alpha: float,
-        bins: int = 10000,
+        bins: int = 100000,
     ) -> LogRankResult:
         """Run log-rank test using PySpark (distributed implementation)."""
         # Validate input schema
@@ -289,13 +267,8 @@ class SurvivalTester:
         ).collect()
         
         # Extract stats for each group
-        group_1_stats = None
-        group_2_stats = None
-        for row in stats_row:
-            if row[group_col] == self._group_1_name:
-                group_1_stats = row
-            else:
-                group_2_stats = row
+        group_1_stats = next((r for r in stats_row if r[group_col] == self._group_1_name), None)
+        group_2_stats = next((r for r in stats_row if r[group_col] == self._group_2_name), None)
         
         if not group_1_stats or not group_2_stats:
              raise ValueError("One or both groups have no data.")
@@ -307,7 +280,7 @@ class SurvivalTester:
         min_dur = min(group_1_stats["min_duration"], group_2_stats["min_duration"])
         max_dur = max(group_1_stats["max_duration"], group_2_stats["max_duration"])
         
-        # Calculate resolution for discretization
+        # Calculate resolution for discretization (Scale Fix)
         duration_range = max_dur - min_dur
         resolution = 1.0 if duration_range == 0 else duration_range / bins
         
@@ -323,7 +296,7 @@ class SurvivalTester:
             F.count(F.lit(1)).alias("total_observed"),  # Total at risk at this time
         )
         
-        # === FIX: EARLY PIVOT ===
+        # === EARLY PIVOT ===
         # Pivot counts first to align time bins. Fill missing activity with 0.
         pivot_df = agg_df.groupBy("duration_bin").pivot(
             group_col, values=[self._group_1_name, self._group_2_name]
@@ -333,13 +306,9 @@ class SurvivalTester:
         ).fillna(0)
         
         # Step 3: Risk Set Calculation (Window) on ALIGNED data
-        # Now we can safely calculate risk sets because missing bins are 0-filled,
-        # allowing the cumulative sum to "hold" the previous value.
         window_spec = Window.orderBy("duration_bin").rowsBetween(
             Window.unboundedPreceding, Window.currentRow
         )
-        
-        # Logic: Risk = Total_N - (Cumulative_Observed_Up_To_Here) + (Observed_In_Current_Bin)
         
         # Group 1 Risk Set
         pivot_df = pivot_df.withColumn(
@@ -367,14 +336,8 @@ class SurvivalTester:
         col_n_1 = F.col(f"{self._group_1_name}_n_at_risk")
         col_n_2 = F.col(f"{self._group_2_name}_n_at_risk")
 
-        pivot_df = pivot_df.withColumn(
-            "Oj",
-            col_d_t_1 + col_d_t_2
-        )
-        pivot_df = pivot_df.withColumn(
-            "Nj",
-            col_n_1 + col_n_2
-        )
+        pivot_df = pivot_df.withColumn("Oj", col_d_t_1 + col_d_t_2)
+        pivot_df = pivot_df.withColumn("Nj", col_n_1 + col_n_2)
         
         # Expected events for group 1
         pivot_df = pivot_df.withColumn(
@@ -423,9 +386,6 @@ class SurvivalTester:
             "n_group_2": n_2,
             "events_group_1": events_1,
             "events_group_2": events_2,
-            "observed_1": O1_sum,
-            "expected_1": E1_sum,
-            "variance": V1_sum,
         }
         
         return LogRankResult(
@@ -531,7 +491,7 @@ class SurvivalTester:
         duration_col: str,
         event_col: str,
         group_col: str = "variant",
-        bins: int = 10000,
+        bins: int = 100000,
     ) -> CriticalTimeResult:
         """Find the critical time when the largest difference between groups occurs."""
         # Get unique groups
@@ -540,6 +500,7 @@ class SurvivalTester:
         else:
             unique_groups = df[group_col].unique().tolist()
         
+        unique_groups.sort()
         if len(unique_groups) != 2:
             raise ValueError(
                 f"Group column must have exactly 2 unique values, "
@@ -583,69 +544,52 @@ class SurvivalTester:
         all_times = np.concatenate([d1, d2])
         unique_times = np.sort(np.unique(all_times))
         
-        # Track per-timepoint and cumulative differences
-        per_timepoint_diffs = []
-        cumulative_diffs = []
         timeline = []
-        cumulative_sum = 0.0
+        excess_events = []
+        cum_excess = []
+        curr_cum = 0.0
         
         for t in unique_times:
             # Events at time t for each group
             o1 = e1[d1 == t].sum()  # Observed in group 1
             o2 = e2[d2 == t].sum()  # Observed in group 2
-            Oj = o1 + o2  # Total observed events at time t
             
             # Risk sets at time t
             n1 = (d1 >= t).sum()  # At risk in group 1
             n2 = (d2 >= t).sum()  # At risk in group 2
-            Nj = n1 + n2  # Total at risk
             
-            if Nj > 0 and Oj > 0:
-                # Expected events in group 1 under null hypothesis
-                E1j = Oj * (n1 / Nj)
+            if (n1+n2) > 0 and (o1+o2) > 0:
+                # Expected events in group 2 (Treatment) under null hypothesis
+                # E2 = O_total * (N2 / N_total)
+                E2 = (o1 + o2) * (n2 / (n1 + n2))
                 
-                # Per-timepoint difference (O1 - E1)
-                per_timepoint_diff = o1 - E1j
+                # Excess = Observed Treatment - Expected Treatment
+                # Pos > 0: Treatment dying FASTER (Bad)
+                # Neg < 0: Treatment dying SLOWER (Good)
+                diff = o2 - E2
                 
+                curr_cum += diff
                 timeline.append(float(t))
-                per_timepoint_diffs.append(float(per_timepoint_diff))
-                cumulative_sum += per_timepoint_diff
-                cumulative_diffs.append(float(cumulative_sum))
+                excess_events.append(float(diff))
+                cum_excess.append(float(curr_cum))
         
-        # Find cumulative max
-        cum_max_idx = np.argmax(np.abs(cumulative_diffs))
-        cumulative_max_time = timeline[cum_max_idx] if timeline else 0.0
-        cumulative_max_diff = cumulative_diffs[cum_max_idx] if cumulative_diffs else 0.0
-        cumulative_max_direction = (
-            f"{group_2_name}_better" if cumulative_max_diff < 0 else f"{group_1_name}_better"
-        )
+        # Crossover Detection (When trend flips from Bad to Good or vice versa)
+        crossover = None
+        for i in range(1, len(cum_excess)):
+            if cum_excess[i-1] > 0 and cum_excess[i] < 0:
+                crossover = timeline[i]
+                break
         
-        # Find per-timepoint max
-        pt_max_idx = np.argmax(np.abs(per_timepoint_diffs))
-        per_timepoint_max_time = timeline[pt_max_idx] if timeline else 0.0
-        per_timepoint_max_diff = per_timepoint_diffs[pt_max_idx] if per_timepoint_diffs else 0.0
-        per_timepoint_max_direction = (
-            f"{group_2_name}_better" if per_timepoint_max_diff < 0 else f"{group_1_name}_better"
-        )
-        
-        # Store stats
-        self._stats = {
-            "n_group_1": len(group_1_data),
-            "n_group_2": len(group_2_data),
-            "events_group_1": int(e1.sum()),
-            "events_group_2": int(e2.sum()),
-        }
+        max_excess = max(cum_excess) if cum_excess else 0.0
+        max_time_idx = np.argmax(cum_excess) if cum_excess else 0
         
         return CriticalTimeResult(
-            cumulative_max_time=cumulative_max_time,
-            cumulative_max_difference=cumulative_max_diff,
-            cumulative_max_direction=cumulative_max_direction,
-            per_timepoint_max_time=per_timepoint_max_time,
-            per_timepoint_max_difference=per_timepoint_max_diff,
-            per_timepoint_max_direction=per_timepoint_max_direction,
+            cumulative_max_time=timeline[max_time_idx] if timeline else 0.0,
+            cumulative_max_excess=max_excess,
+            crossover_time=crossover,
             timeline=timeline,
-            cumulative_differences=cumulative_diffs,
-            per_timepoint_differences=per_timepoint_diffs,
+            cumulative_excess_events=cum_excess,
+            per_timepoint_excess=excess_events,
             group_1_name=group_1_name,
             group_2_name=group_2_name,
         )
@@ -658,7 +602,7 @@ class SurvivalTester:
         group_col: str,
         group_1_name: str,
         group_2_name: str,
-        bins: int = 10000,
+        bins: int = 100000,
     ) -> CriticalTimeResult:
         """Find critical time using PySpark with EARLY PIVOT stability."""
         
@@ -692,7 +636,7 @@ class SurvivalTester:
             F.count(F.lit(1)).alias("total_observed"),
         )
         
-        # --- 3. EARLY PIVOT (The Fix for Sparse Bins) ---
+        # --- 3. EARLY PIVOT (Required for Risk Set Alignment) ---
         pivot_df = agg_df.groupBy("duration_bin").pivot(
             group_col, values=[group_1_name, group_2_name]
         ).agg(
@@ -725,7 +669,7 @@ class SurvivalTester:
             F.lit(n_2) - F.col(f"{group_2_name}_cum_obs") + F.col(f"{group_2_name}_total_observed")
         )
         
-        # --- 5. Calculate Divergence (O - E) ---
+        # --- 5. Calculate Divergence (Excess Events) ---
         col_d_t_1 = F.col(f"{group_1_name}_d_t")
         col_d_t_2 = F.col(f"{group_2_name}_d_t")
         col_n_1 = F.col(f"{group_1_name}_n_at_risk")
@@ -734,69 +678,50 @@ class SurvivalTester:
         pivot_df = pivot_df.withColumn("Oj", col_d_t_1 + col_d_t_2)
         pivot_df = pivot_df.withColumn("Nj", col_n_1 + col_n_2)
         
-        # Expected events for Group 1 (Control)
+        # Expected events for Group 2 (Treatment)
         pivot_df = pivot_df.withColumn(
-            "E1j",
-            F.when(F.col("Nj") > 0, F.col("Oj") * col_n_1 / F.col("Nj")).otherwise(0)
+            "E2",
+            F.when(F.col("Nj") > 0, F.col("Oj") * col_n_2 / F.col("Nj")).otherwise(0)
         )
         
-        # Diff = Observed_Control - Expected_Control
-        # Positive Diff => Control has EXCESS events (Dying faster) => Treatment is BETTER
-        pivot_df = pivot_df.withColumn("diff", col_d_t_1 - F.col("E1j"))
+        # Excess = Observed_Treatment - Expected_Treatment
+        pivot_df = pivot_df.withColumn("excess_events", col_d_t_2 - F.col("E2"))
         
         # Collect results sorted by time
-        results = pivot_df.select("duration_bin", "diff").orderBy("duration_bin").collect()
+        results = pivot_df.select("duration_bin", "excess_events").orderBy("duration_bin").collect()
         
         # --- 6. Python-side Trajectory Analysis ---
         timeline = []
-        per_timepoint_diffs = []
-        cumulative_diffs = []
-        cumulative_sum = 0.0
+        excess_events = []
+        cum_excess = []
+        curr_cum = 0.0
         
         for row in results:
             t = float(row["duration_bin"])
-            diff = float(row["diff"])
+            diff = float(row["excess_events"] or 0.0)
             
+            curr_cum += diff
             timeline.append(t)
-            per_timepoint_diffs.append(diff)
+            excess_events.append(diff)
+            cum_excess.append(curr_cum)
             
-            cumulative_sum += diff
-            cumulative_diffs.append(cumulative_sum)
-            
-        # --- 7. Metrics & Direction Fix ---
-        
-        # Cumulative Max (Point of Maximum Total Impact)
-        cum_max_idx = np.argmax(np.abs(cumulative_diffs)) if cumulative_diffs else 0
-        cum_max_time = timeline[cum_max_idx] if timeline else 0.0
-        cum_max_val = cumulative_diffs[cum_max_idx] if cumulative_diffs else 0.0
-        
-        # FIX: Direction Logic
-        # If Cumulative Diff > 0 => Control Events > Expected => Control Worse => Treatment Better
-        if cum_max_val > 0:
-            cum_direction = f"{group_2_name}_better" # Treatment Better
-        else:
-            cum_direction = f"{group_1_name}_better" # Control Better
+        # Crossover
+        crossover = None
+        for i in range(1, len(cum_excess)):
+            if cum_excess[i-1] > 0 and cum_excess[i] < 0:
+                crossover = timeline[i]
+                break
 
-        # Per-Timepoint Max (Point of Maximum Instantaneous Divergence)
-        pt_max_idx = np.argmax(np.abs(per_timepoint_diffs)) if per_timepoint_diffs else 0
-        pt_max_time = timeline[pt_max_idx] if timeline else 0.0
-        pt_max_val = per_timepoint_diffs[pt_max_idx] if per_timepoint_diffs else 0.0
-        
-        if pt_max_val > 0:
-            pt_direction = f"{group_2_name}_better"
-        else:
-            pt_direction = f"{group_1_name}_better"
+        max_excess = max(cum_excess) if cum_excess else 0.0
+        max_time_idx = np.argmax(cum_excess) if cum_excess else 0
 
         return CriticalTimeResult(
-            cumulative_max_time=cum_max_time,
-            cumulative_max_difference=cum_max_val,
-            cumulative_max_direction=cum_direction,
-            per_timepoint_max_time=pt_max_time,
-            per_timepoint_max_difference=pt_max_val,
-            per_timepoint_max_direction=pt_direction,
+            cumulative_max_time=timeline[max_time_idx] if timeline else 0.0,
+            cumulative_max_excess=max_excess,
+            crossover_time=crossover,
             timeline=timeline,
-            cumulative_differences=cumulative_diffs,
-            per_timepoint_differences=per_timepoint_diffs,
+            cumulative_excess_events=cum_excess,
+            per_timepoint_excess=excess_events,
             group_1_name=group_1_name,
             group_2_name=group_2_name,
         )
@@ -809,7 +734,7 @@ class SurvivalTester:
         group_col: str = "variant",
         test_type: str = "log_rank",
         alpha: float = 0.05,
-        bins: int = 10000,
+        bins: int = 100000,
     ) -> Dict[str, Any]:
         """Run log-rank test AND critical time analysis in a single call."""
         # Run log-rank test first

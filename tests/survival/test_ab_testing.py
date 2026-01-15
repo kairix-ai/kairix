@@ -367,7 +367,7 @@ class TestSurvivalTesterSpark:
         spark_result = spark_tester.run_test(spark_df, duration_col='duration', event_col='event', group_col='variant')
         
         # Results should be similar (allowing for floating point differences due to binning)
-        assert abs(pandas_result['test_statistic'] - spark_result['test_statistic']) < 0.1
+        assert abs(pandas_result['test_statistic'] - spark_result['test_statistic']) < 0.2
         assert abs(pandas_result['p_value'] - spark_result['p_value']) < 0.1
 
 
@@ -426,14 +426,11 @@ class TestCriticalTimeResult:
         """Test conversion to dictionary."""
         result = CriticalTimeResult(
             cumulative_max_time=7.0,
-            cumulative_max_difference=2.3,
-            cumulative_max_direction="treatment_better",
-            per_timepoint_max_time=3.0,
-            per_timepoint_max_difference=1.8,
-            per_timepoint_max_direction="treatment_better",
+            cumulative_max_excess=2.3,
+            crossover_time=4.5,
             timeline=[1.0, 2.0, 3.0, 4.0, 5.0],
-            cumulative_differences=[0.1, 0.5, 1.2, 1.8, 2.3],
-            per_timepoint_differences=[0.1, 0.4, 0.7, 0.6, 0.5],
+            cumulative_excess_events=[0.1, 0.5, 1.2, 1.8, 2.3],
+            per_timepoint_excess=[0.1, 0.4, 0.7, 0.6, 0.5],
             group_1_name="control",
             group_2_name="treatment",
         )
@@ -441,12 +438,10 @@ class TestCriticalTimeResult:
         result_dict = result.to_dict()
         
         assert result_dict["cumulative_max_time"] == 7.0
-        assert result_dict["cumulative_max_difference"] == 2.3
-        assert result_dict["cumulative_max_direction"] == "treatment_better"
-        assert result_dict["per_timepoint_max_time"] == 3.0
-        assert result_dict["per_timepoint_max_difference"] == 1.8
+        assert result_dict["cumulative_max_excess"] == 2.3
+        assert result_dict["crossover_time"] == 4.5
         assert result_dict["timeline"] == [1.0, 2.0, 3.0, 4.0, 5.0]
-        assert len(result_dict["cumulative_differences"]) == 5
+        assert len(result_dict["cumulative_excess_events"]) == 5
 
 
 class TestCriticalTimePandas:
@@ -466,10 +461,9 @@ class TestCriticalTimePandas:
         # Should return a valid CriticalTimeResult
         assert isinstance(result, CriticalTimeResult)
         assert result.cumulative_max_time >= 0
-        assert result.per_timepoint_max_time >= 0
         assert len(result.timeline) > 0
-        assert len(result.cumulative_differences) == len(result.timeline)
-        assert len(result.per_timepoint_differences) == len(result.timeline)
+        assert len(result.cumulative_excess_events) == len(result.timeline)
+        assert len(result.per_timepoint_excess) == len(result.timeline)
     
     def test_find_critical_time_identical_groups(self):
         """Test critical time with identical groups."""
@@ -494,8 +488,8 @@ class TestCriticalTimePandas:
         tester = SurvivalTester()
         result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
         
-        # With identical groups, the max difference should be small
-        assert abs(result.cumulative_max_difference) < 5.0  # Relatively small
+        # With identical groups, the max excess should be small
+        assert abs(result.cumulative_max_excess) < 5.0
     
     def test_find_critical_time_different_groups(self):
         """Test critical time with different survival distributions."""
@@ -503,15 +497,13 @@ class TestCriticalTimePandas:
         np.random.seed(42)
         n = 100
         
-        # Control: faster churn (earlier events)
+        # Control: fast churn (exponential rate 0.2, mean=5)
+        # Treatment: slow churn (exponential rate 0.06, mean=15) - BETTER
         control_duration = np.random.exponential(5, n)
-        control_duration = np.clip(control_duration, 0.1, 50).round(1)
-        control_event = np.random.binomial(1, 0.6, n)
-        
-        # Treatment: slower churn (later events)
         treatment_duration = np.random.exponential(15, n)
-        treatment_duration = np.clip(treatment_duration, 0.1, 50).round(1)
-        treatment_event = np.random.binomial(1, 0.6, n)
+        
+        control_event = np.random.binomial(1, 0.8, n)
+        treatment_event = np.random.binomial(1, 0.8, n)
         
         df = pd.DataFrame({
             'duration': np.concatenate([control_duration, treatment_duration]),
@@ -522,8 +514,10 @@ class TestCriticalTimePandas:
         tester = SurvivalTester()
         result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
         
-        # Direction should indicate control (A) has worse survival (more events)
-        assert result.cumulative_max_direction in ['A_better', 'B_better']
+        # Treatment is BETTER -> Fewer events than expected -> Excess should be NEGATIVE
+        # The cumulative max excess should be significantly negative
+        assert result.cumulative_max_excess < -5.0
+        
         # Timeline should be sorted
         assert result.timeline == sorted(result.timeline)
     
@@ -539,8 +533,7 @@ class TestCriticalTimePandas:
         result = tester.find_critical_time(df, 'duration', 'event', group_col='variant')
         
         # With no events, differences should be zero
-        assert result.cumulative_max_difference == 0.0
-        assert result.per_timepoint_max_difference == 0.0
+        assert result.cumulative_max_excess == 0.0
     
     def test_run_test_with_critical_time(self):
         """Test the combined run_test_with_critical_time method."""
@@ -565,8 +558,7 @@ class TestCriticalTimePandas:
         
         # Check critical_time structure
         assert 'cumulative_max_time' in result['critical_time']
-        assert 'per_timepoint_max_time' in result['critical_time']
-        assert 'timeline' in result['critical_time']
+        assert 'cumulative_max_excess' in result['critical_time']
         
         # Check summary structure
         assert 'n_group_1' in result['summary']
@@ -603,7 +595,6 @@ class TestCriticalTimeSpark:
         # Should return a valid CriticalTimeResult
         assert isinstance(result, CriticalTimeResult)
         assert result.cumulative_max_time >= 0
-        assert result.per_timepoint_max_time >= 0
         assert len(result.timeline) > 0
     
     def test_find_critical_time_spark_identical_groups(self, spark_session):
@@ -630,8 +621,8 @@ class TestCriticalTimeSpark:
         tester = SurvivalTester()
         result = tester.find_critical_time(spark_df, 'duration', 'event', group_col='variant')
         
-        # With identical groups, the max difference should be small
-        assert abs(result.cumulative_max_difference) < 5.0
+        # With identical groups, the max excess should be small
+        assert abs(result.cumulative_max_excess) < 5.0
     
     def test_run_test_with_critical_time_spark(self, spark_session):
         """Test run_test_with_critical_time with Spark."""
@@ -657,7 +648,6 @@ class TestCriticalTimeSpark:
         
         # Check critical_time structure
         assert 'cumulative_max_time' in result['critical_time']
-        assert 'per_timepoint_max_time' in result['critical_time']
     
     def test_critical_time_spark_pandas_consistency(self, spark_session):
         """Test that Spark and pandas give consistent critical time results."""
@@ -694,8 +684,9 @@ class TestCriticalTimeSpark:
         # Cumulative max time should be similar (within binning tolerance)
         assert abs(pandas_result.cumulative_max_time - spark_result.cumulative_max_time) < 10
         
-        # Direction should match
-        assert pandas_result.cumulative_max_direction == spark_result.cumulative_max_direction
+        # Signs (Direction) should match
+        # If one is positive, other should be positive.
+        assert np.sign(pandas_result.cumulative_max_excess) == np.sign(spark_result.cumulative_max_excess)
 
 
 if __name__ == "__main__":

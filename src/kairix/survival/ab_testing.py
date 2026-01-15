@@ -105,6 +105,80 @@ class CriticalTimeResult:
         }
 
 
+@dataclass
+class RMSTResult:
+    """Result of RMST (Restricted Mean Survival Time) comparison.
+    
+    Attributes:
+        diff: Difference in RMST (treatment - control).
+        p_value: Two-sided p-value from Z-test.
+        z_score: Z-statistic for the test.
+        horizon: The time horizon used for RMST calculation.
+        significant: Whether the difference is statistically significant.
+        treatment_rmst: RMST of the treatment group.
+        control_rmst: RMST of the control group.
+        ci_lower: 95% CI lower bound for the difference.
+        ci_upper: 95% CI upper bound for the difference.
+        group_1_name: Name of the control group.
+        group_2_name: Name of the treatment group.
+    """
+    diff: float
+    p_value: float
+    z_score: float
+    horizon: float
+    significant: bool = False
+    treatment_rmst: float = 0.0
+    control_rmst: float = 0.0
+    ci_lower: float = 0.0
+    ci_upper: float = 0.0
+    group_1_name: str = "control"
+    group_2_name: str = "treatment"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert result to dictionary."""
+        return {
+            "diff": self.diff,
+            "p_value": self.p_value,
+            "z_score": self.z_score,
+            "horizon": self.horizon,
+            "significant": self.significant,
+            "treatment_rmst": self.treatment_rmst,
+            "control_rmst": self.control_rmst,
+            "ci_lower": self.ci_lower,
+            "ci_upper": self.ci_upper,
+            "group_1_name": self.group_1_name,
+            "group_2_name": self.group_2_name,
+        }
+
+
+@dataclass
+class HorizonAnalysisResult:
+    """Result of Horizon Analysis (Short-term vs Long-term RMST comparison).
+    
+    This analysis helps identify:
+    - J-Curve Effect: Harmful initially, beneficial later
+    - Universal Harm: Harmful at both short and long term
+    - Universal Benefit: Beneficial at both short and long term
+    - Learning Curve: Benefit that develops over time
+    
+    Attributes:
+        status: The status of the treatment effect.
+        short_term_result: RMST result for short-term horizon.
+        long_term_result: RMST result for long-term horizon.
+    """
+    status: str
+    short_term_result: Dict[str, Any]
+    long_term_result: Dict[str, Any]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert result to dictionary."""
+        return {
+            "status": self.status,
+            "short_term": self.short_term_result,
+            "long_term": self.long_term_result,
+        }
+
+
 class SurvivalTester:
     """A/B Testing for Survival Analysis.
     
@@ -131,7 +205,12 @@ class SurvivalTester:
         alpha: float = 0.05,
         bins: int = 100000, 
     ) -> Dict[str, Any]:
-        """Run a statistical test comparing survival curves between two groups."""
+        """Run a statistical test comparing survival curves between two groups.
+        
+        Warning:
+            If survival curves cross (non-proportional hazards detected), 
+            a warning is issued recommending use of analyze_horizons() for robust inference.
+        """
         # Get unique groups
         if isinstance(df, SparkDataFrame):
             unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
@@ -148,6 +227,24 @@ class SurvivalTester:
         # Set group names (first is control, second is treatment)
         self._group_1_name = str(unique_groups[0])
         self._group_2_name = str(unique_groups[1])
+        
+        # Check for crossing curves (non-proportional hazards)
+        # This is a warning, not an error - we still run the test
+        try:
+            critical_result = self.find_critical_time(
+                df, duration_col, event_col, group_col, bins
+            )
+            if critical_result.crossover_time is not None:
+                import warnings
+                warnings.warn(
+                    "Warning: Proportional hazards violated (survival curves cross at "
+                    f"t={critical_result.crossover_time:.2f}). "
+                    "Use analyze_horizons() for robust inference with RMST.",
+                    UserWarning
+                )
+        except Exception:
+            # If critical time detection fails, just proceed with the test
+            pass
         
         # Dispatch to appropriate implementation
         if isinstance(df, SparkDataFrame):
@@ -785,3 +882,193 @@ class SurvivalTester:
     def group_names(self) -> Tuple[str, str]:
         """Get the names of the two groups being compared."""
         return (self._group_1_name, self._group_2_name)
+    
+    def compare_rmst(
+        self,
+        df: Union[pd.DataFrame, SparkDataFrame],
+        duration_col: str,
+        event_col: str,
+        group_col: str = "variant",
+        time_horizon: float = 100,
+        alpha: float = 0.05,
+        bins: int = 100000,
+    ) -> Dict[str, Any]:
+        """Compare RMST between two groups using Restricted Mean Survival Time.
+        
+        RMST is a robust alternative to the log-rank test when survival curves
+        cross (non-proportional hazards). It measures the area under the survival
+        curve up to a specified time horizon.
+        
+        Args:
+            df: Input DataFrame containing survival data.
+            duration_col: Column name for duration/time-to-event.
+            event_col: Column name for event indicator (0=censored, 1=event).
+            group_col: Column name for group assignment.
+            time_horizon: Time horizon for RMST calculation.
+            alpha: Significance level for the test.
+            bins: Number of discretization bins (for Spark).
+        
+        Returns:
+            Dictionary containing RMST comparison results:
+                - diff: RMST treatment - RMST control
+                - p_value: Two-sided p-value from Z-test
+                - z_score: Z-statistic for the test
+                - horizon: The time horizon used
+                - significant: Whether the difference is statistically significant
+                - treatment_rmst: RMST of treatment group
+                - control_rmst: RMST of control group
+        """
+        # Dispatch to appropriate implementation
+        if isinstance(df, SparkDataFrame):
+            from kairix.survival.spark_impl import KaplanMeier
+            result = KaplanMeier.compare_rmst(
+                df, duration_col, event_col, group_col, time_horizon,
+                alpha=alpha, bins=bins
+            )
+        else:
+            from kairix.survival.local_impl import KaplanMeierFitter
+            result = KaplanMeierFitter.compare_rmst(
+                df, duration_col, event_col, group_col, time_horizon,
+                alpha=alpha
+            )
+        
+        # Store stats
+        self._stats = result.get('summary', {})
+        self._is_fitted = True
+        
+        return result
+    
+    def analyze_horizons(
+        self,
+        df: Union[pd.DataFrame, SparkDataFrame],
+        duration_col: str,
+        event_col: str,
+        group_col: str = "variant",
+        short_term_day: float = 10,
+        long_term_day: float = 100,
+        alpha: float = 0.05,
+        bins: int = 100000,
+    ) -> Dict[str, Any]:
+        """Analyze treatment effects across short-term and long-term horizons.
+        
+        This "Inference Matrix" approach helps identify:
+        - J-Curve Effect: Harmful initially (short-term), beneficial later (long-term)
+        - Universal Harm: Harmful at both time horizons
+        - Universal Benefit: Beneficial at both time horizons
+        - Learning Curve: Benefit that develops over time
+        
+        Args:
+            df: Input DataFrame containing survival data.
+            duration_col: Column name for duration/time-to-event.
+            event_col: Column name for event indicator (0=censored, 1=event).
+            group_col: Column name for group assignment.
+            short_term_day: Time horizon for short-term analysis.
+            long_term_day: Time horizon for long-term analysis.
+            alpha: Significance level for the tests.
+            bins: Number of discretization bins (for Spark).
+        
+        Returns:
+            Dictionary containing:
+                - status: The identified effect pattern
+                - short_term: RMST result for short-term horizon
+                - long_term: RMST result for long-term horizon
+        """
+        # Get unique groups
+        if isinstance(df, SparkDataFrame):
+            unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
+        else:
+            unique_groups = df[group_col].unique().tolist()
+        
+        unique_groups.sort()
+        if len(unique_groups) != 2:
+            raise ValueError(
+                f"Group column must have exactly 2 unique values, "
+                f"found {len(unique_groups)}: {unique_groups}"
+            )
+        
+        group_1_name = str(unique_groups[0])
+        group_2_name = str(unique_groups[1])
+        
+        # Compute RMST at both horizons
+        short_result = self.compare_rmst(
+            df, duration_col, event_col, group_col,
+            time_horizon=short_term_day, alpha=alpha, bins=bins
+        )
+        
+        long_result = self.compare_rmst(
+            df, duration_col, event_col, group_col,
+            time_horizon=long_term_day, alpha=alpha, bins=bins
+        )
+        
+        # Determine status based on patterns
+        # Note: In our convention, negative diff = treatment is BETTER
+        short_diff = short_result['diff']
+        long_diff = long_result['diff']
+        short_sig = short_result['significant'] and short_result['p_value'] < alpha
+        long_sig = long_result['significant'] and long_result['p_value'] < alpha
+        
+        # Interpret results
+        if short_diff < 0 and short_sig and long_diff > 0 and long_sig:
+            status = "J-Curve / Learning Curve Effect"
+            description = (
+                "Treatment shows initial harm (shorter survival at short-term) "
+                "but long-term benefit (longer survival at long-term). "
+                "This may indicate a learning curve or delayed treatment effect."
+            )
+        elif short_diff < 0 and short_sig and long_diff < 0 and long_sig:
+            status = "Universal Harm"
+            description = (
+                "Treatment shows consistent harm at both short-term and long-term horizons. "
+                "Consider discontinuing the treatment."
+            )
+        elif short_diff > 0 and short_sig and long_diff > 0 and long_sig:
+            status = "Universal Benefit"
+            description = (
+                "Treatment shows consistent benefit at both short-term and long-term horizons. "
+                "This is the ideal outcome."
+            )
+        elif short_diff > 0 and short_sig and long_diff < 0 and long_sig:
+            status = "Reversal Effect"
+            description = (
+                "Treatment shows initial benefit but long-term harm. "
+                "This may indicate long-term side effects."
+            )
+        elif short_diff < 0 and long_diff < 0 and (short_sig or long_sig):
+            status = "Consistent Benefit Trend"
+            description = (
+                "Treatment shows benefit trend at both horizons, "
+                "though not always statistically significant."
+            )
+        elif short_diff > 0 and long_diff > 0 and (short_sig or long_sig):
+            status = "Consistent Harm Trend"
+            description = (
+                "Treatment shows harm trend at both horizons, "
+                "though not always statistically significant."
+            )
+        elif abs(short_diff) < abs(long_diff):
+            status = "Delayed Effect"
+            description = (
+                "Treatment effect develops over time. "
+                "Long-term effects are more pronounced than short-term."
+            )
+        else:
+            status = "Inconclusive"
+            description = (
+                "No clear pattern detected. Results may be confounded "
+                "by censoring or other factors."
+            )
+        
+        return {
+            "status": status,
+            "description": description,
+            "short_term": {
+                **short_result,
+                "interpretation": "Beneficial" if short_diff < 0 else "Harmful" if short_diff > 0 else "No Effect"
+            },
+            "long_term": {
+                **long_result,
+                "interpretation": "Beneficial" if long_diff < 0 else "Harmful" if long_diff > 0 else "No Effect"
+            },
+            "group_1_name": group_1_name,
+            "group_2_name": group_2_name,
+        }

@@ -1,6 +1,6 @@
 """Distributed Kaplan-Meier estimator for large-scale survival analysis using PySpark."""
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
@@ -8,6 +8,7 @@ from pyspark.sql.types import DoubleType, Row
 
 # Ensure kairix.core.validation is available or mock this for standalone testing
 from kairix.core.validation import validate_input_schema
+from kairix.statistics.rmst import RMSTEngine
 
 
 class KaplanMeier:
@@ -378,3 +379,160 @@ class KaplanMeier:
     def survival_prob(self):
         """Alias for survival_function_ for compatibility."""
         return self.survival_function_.values
+    
+    def compute_rmst(
+        self,
+        time_horizon: float,
+    ) -> Dict[str, float]:
+        """Compute Restricted Mean Survival Time at a given time horizon.
+        
+        Args:
+            time_horizon: The truncation time point for RMST calculation.
+        
+        Returns:
+            Dictionary containing RMST and variance calculations:
+                - rmst: Restricted Mean Survival Time
+                - variance: Variance of the RMST estimate
+                - std_error: Standard error
+                - ci_lower: 95% CI lower bound
+                - ci_upper: 95% CI upper bound
+        """
+        if not self.is_fitted:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+        
+        if self.survival_df is None:
+            raise ValueError("Survival DataFrame is not available.")
+        
+        # Collect the survival DataFrame to driver (it's small - aggregated data)
+        pdf = self.survival_df.toPandas()
+        
+        # Prepare arrays for RMSTEngine
+        times = pdf["duration"].values
+        probs = pdf["survival_probability"].values
+        event_counts = pdf["n_events"].values
+        at_risk_counts = pdf["n_at_risk"].values
+        
+        engine = RMSTEngine(time_horizon)
+        return engine._compute_from_arrays(times, probs, event_counts, at_risk_counts)
+    
+    @staticmethod
+    def compare_rmst(
+        df: DataFrame,
+        duration_col: str,
+        event_col: str,
+        group_col: str,
+        time_horizon: float,
+        group_1_name: Optional[str] = None,
+        group_2_name: Optional[str] = None,
+        alpha: float = 0.05,
+        bins: int = 10000,
+    ) -> Dict[str, Any]:
+        """Compare RMST between two groups using distributed computation.
+        
+        This is a static method that fits Kaplan-Meier estimators for both groups
+        using distributed Spark computation and computes the RMST difference.
+        
+        Args:
+            df: Input PySpark DataFrame containing survival data.
+            duration_col: Column name for duration/time-to-event.
+            event_col: Column name for event indicator (0=censored, 1=event).
+            group_col: Column name for group assignment.
+            time_horizon: Time horizon for RMST calculation.
+            group_1_name: Name of the control group. If None, uses first unique value.
+            group_2_name: Name of the treatment group. If None, uses second unique value.
+            alpha: Significance level for the test.
+            bins: Number of discretization bins for KM estimation.
+        
+        Returns:
+            Dictionary containing:
+                - diff: RMST treatment - RMST control
+                - p_value: Two-sided p-value from Z-test
+                - z_score: Z-statistic for the test
+                - horizon: The time horizon used
+                - significant: Whether the difference is statistically significant
+                - treatment_rmst: RMST of treatment group
+                - control_rmst: RMST of control group
+                - group_1_name: Name of control group
+                - group_2_name: Name of treatment group
+        """
+        # Get unique groups
+        unique_groups = [row[0] for row in df.select(group_col).distinct().collect()]
+        if len(unique_groups) != 2:
+            raise ValueError(
+                f"Group column must have exactly 2 unique values, "
+                f"found {len(unique_groups)}: {unique_groups}"
+            )
+        
+        if group_1_name is None:
+            group_1_name = str(unique_groups[0])
+        if group_2_name is None:
+            group_2_name = str(unique_groups[1])
+        
+        # Filter and fit KMF for each group
+        group_1_data = df.filter(F.col(group_col) == group_1_name)
+        group_2_data = df.filter(F.col(group_col) == group_2_name)
+        
+        kmf_1 = KaplanMeier()
+        kmf_1.fit(
+            group_1_data,
+            duration_col=duration_col,
+            event_col=event_col,
+            bins=bins,
+        )
+        
+        kmf_2 = KaplanMeier()
+        kmf_2.fit(
+            group_2_data,
+            duration_col=duration_col,
+            event_col=event_col,
+            bins=bins,
+        )
+        
+        # Compute RMST for each group
+        result_1 = kmf_1.compute_rmst(time_horizon)
+        result_2 = kmf_2.compute_rmst(time_horizon)
+        
+        # Compute difference with Z-test
+        diff = result_2['rmst'] - result_1['rmst']
+        pooled_var = result_2['variance'] + result_1['variance']
+        pooled_se = (pooled_var ** 0.5) if pooled_var > 0 else 0.0
+        
+        if pooled_se > 0:
+            z_score = diff / pooled_se
+        else:
+            z_score = 0.0
+        
+        from scipy import stats
+        p_value = 2.0 * (1.0 - stats.norm.cdf(abs(z_score)))
+        significant = p_value < alpha
+        
+        # 95% CI for difference
+        z_975 = stats.norm.ppf(1.0 - alpha / 2)
+        ci_lower = diff - z_975 * pooled_se
+        ci_upper = diff + z_975 * pooled_se
+        
+        # Get summary stats
+        summary_1 = kmf_1.summary()
+        summary_2 = kmf_2.summary()
+        
+        return {
+            "diff": float(diff),
+            "p_value": float(p_value),
+            "z_score": float(z_score),
+            "horizon": time_horizon,
+            "significant": bool(significant),
+            "treatment_rmst": result_2['rmst'],
+            "control_rmst": result_1['rmst'],
+            "treatment_variance": result_2['variance'],
+            "control_variance": result_1['variance'],
+            "ci_lower": float(ci_lower),
+            "ci_upper": float(ci_upper),
+            "group_1_name": group_1_name,
+            "group_2_name": group_2_name,
+            "summary": {
+                'n_group_1': summary_1['n_samples'],
+                'n_group_2': summary_2['n_samples'],
+                'events_group_1': summary_1['total_events'],
+                'events_group_2': summary_2['total_events'],
+            },
+        }

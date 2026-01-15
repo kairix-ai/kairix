@@ -4,10 +4,12 @@ This module provides a pandas-based Kaplan-Meier estimator that wraps
 the lifelines library for local/small-scale survival analysis.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, List
 
 import pandas as pd
 import numpy as np
+
+from kairix.statistics.rmst import RMSTEngine
 
 
 class KaplanMeierFitter:
@@ -162,3 +164,114 @@ class KaplanMeierFitter:
     def is_fitted(self) -> bool:
         """Whether the model has been fitted."""
         return self._is_fitted
+    
+    def compute_rmst(
+        self,
+        time_horizon: float,
+    ) -> Dict[str, float]:
+        """Compute Restricted Mean Survival Time at a given time horizon.
+        
+        Args:
+            time_horizon: The truncation time point for RMST calculation.
+        
+        Returns:
+            Dictionary containing RMST and variance calculations:
+                - rmst: Restricted Mean Survival Time
+                - variance: Variance of the RMST estimate
+                - std_error: Standard error
+                - ci_lower: 95% CI lower bound
+                - ci_upper: 95% CI upper bound
+        """
+        if not self._is_fitted:
+            raise ValueError("Model has not been fitted. Call fit() first.")
+        
+        engine = RMSTEngine(time_horizon)
+        return engine._compute_from_lifelines(self._lifelines_kmf)
+    
+    @staticmethod
+    def compare_rmst(
+        df: pd.DataFrame,
+        duration_col: str,
+        event_col: str,
+        group_col: str,
+        time_horizon: float,
+        group_1_name: Optional[str] = None,
+        group_2_name: Optional[str] = None,
+        alpha: float = 0.05,
+    ) -> Dict[str, Any]:
+        """Compare RMST between two groups using log-rank style interface.
+        
+        This is a static method that fits Kaplan-Meier estimators for both groups
+        and computes the RMST difference with statistical testing.
+        
+        Args:
+            df: DataFrame containing survival data.
+            duration_col: Column name for duration/time-to-event.
+            event_col: Column name for event indicator (0=censored, 1=event).
+            group_col: Column name for group assignment.
+            time_horizon: Time horizon for RMST calculation.
+            group_1_name: Name of the control group. If None, uses first unique value.
+            group_2_name: Name of the treatment group. If None, uses second unique value.
+            alpha: Significance level for the test.
+        
+        Returns:
+            Dictionary containing:
+                - diff: RMST treatment - RMST control
+                - p_value: Two-sided p-value from Z-test
+                - z_score: Z-statistic for the test
+                - horizon: The time horizon used
+                - significant: Whether the difference is statistically significant
+                - treatment_rmst: RMST of treatment group
+                - control_rmst: RMST of control group
+                - group_1_name: Name of control group
+                - group_2_name: Name of treatment group
+        """
+        # Get unique groups
+        unique_groups = df[group_col].unique().tolist()
+        if len(unique_groups) != 2:
+            raise ValueError(
+                f"Group column must have exactly 2 unique values, "
+                f"found {len(unique_groups)}: {unique_groups}"
+            )
+        
+        if group_1_name is None:
+            group_1_name = str(unique_groups[0])
+        if group_2_name is None:
+            group_2_name = str(unique_groups[1])
+        
+        # Split data
+        group_1_data = df[df[group_col] == group_1_name]
+        group_2_data = df[df[group_col] == group_2_name]
+        
+        # Fit KMF for each group
+        kmf_1 = KaplanMeierFitter()
+        kmf_1.fit(
+            group_1_data[duration_col],
+            group_1_data[event_col],
+            label=group_1_name,
+        )
+        
+        kmf_2 = KaplanMeierFitter()
+        kmf_2.fit(
+            group_2_data[duration_col],
+            group_2_data[event_col],
+            label=group_2_name,
+        )
+        
+        # Compute RMST comparison
+        engine = RMSTEngine(time_horizon)
+        result = engine.calculate_diff_test(kmf_2, kmf_1, alpha=alpha)
+        
+        # Store group names
+        result['group_1_name'] = group_1_name
+        result['group_2_name'] = group_2_name
+        
+        # Store summary stats
+        result['summary'] = {
+            'n_group_1': len(group_1_data),
+            'n_group_2': len(group_2_data),
+            'events_group_1': int(group_1_data[event_col].sum()),
+            'events_group_2': int(group_2_data[event_col].sum()),
+        }
+        
+        return result

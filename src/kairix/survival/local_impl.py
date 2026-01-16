@@ -52,9 +52,9 @@ class KaplanMeierFitter:
         # Lifelines uses alpha (1 - confidence), not confidence_level
         alpha = kwargs.pop("alpha", 0.05)
         self._fitted_alpha = alpha
-        
-        # Handle label: prefer passed kwarg (from compare_rmst), default to generic
-        # This prevents "multiple values for keyword argument 'label'" error
+
+        # Handle label: prefer passed kwarg, default to generic
+        # We must POP it to avoid conflict with our own explicit 'label' arg below
         label = kwargs.pop("label", "survival_probability")
         
         # Fit the lifelines estimator
@@ -224,26 +224,34 @@ class KaplanMeierFitter:
         group_2_data = df[df[group_col] == group_2_name]
         
         # Fit KMF for each group
-        # Passes df and column names to match the fit() signature
+        # Kairix wrapper fit() expects (df, col_name, col_name)
         kmf_1 = KaplanMeierFitter()
         kmf_1.fit(
-            group_1_data,    # df
-            duration_col,    # col name string
-            event_col,       # col name string
+            group_1_data,
+            duration_col,
+            event_col,
             label=group_1_name,
         )
         
         kmf_2 = KaplanMeierFitter()
         kmf_2.fit(
-            group_2_data,    # df
-            duration_col,    # col name string
-            event_col,       # col name string
+            group_2_data,
+            duration_col,
+            event_col,
             label=group_2_name,
         )
         
         # Compute RMST comparison
         engine = RMSTEngine(time_horizon)
-        result = engine.calculate_diff_test(kmf_2, kmf_1, alpha=alpha)
+        
+        # FIX: Pass the internal Lifelines objects to the engine.
+        # The engine expects either a dict or an object with .survival_function_
+        # The Kairix wrapper (kmf_1) hides the lifelines object in _lifelines_kmf.
+        result = engine.calculate_diff_test(
+            kmf_2._lifelines_kmf, 
+            kmf_1._lifelines_kmf, 
+            alpha=alpha
+        )
         
         # Store group names
         result['group_1_name'] = group_1_name

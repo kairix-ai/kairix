@@ -111,6 +111,11 @@ class RMSTEngine:
             # Add the time_horizon point with the last survival probability
             times = np.append(times, self.time_horizon)
             probs = np.append(probs, probs[-1])
+            
+            # FIX: Also extend counts to match length, preventing IndexError.
+            # We append 0 since the horizon cutoff is not an event time.
+            event_counts = np.append(event_counts, 0.0)
+            at_risk_counts = np.append(at_risk_counts, 0.0)
         
         # Compute RMST using the trapezoidal rule (rectangle summation for step functions)
         # For Kaplan-Meier, we use left-endpoint rectangle summation
@@ -135,11 +140,10 @@ class RMSTEngine:
             s_tau = 1.0
         
         # Variance contribution from each time point
-        # Using the formula: Var(RMST) = sum_i [S(tau)^2 * dN_i / Y_i^2] * (time_horizon - t_i)
-        # This is for the integrated variance
-        
         variance = 0.0
         for i in range(len(times)):
+            # Check > 0 to avoid division by zero
+            # The appended horizon point has counts=0, so it safely skips this block
             if at_risk_counts[i] > 0 and event_counts[i] > 0:
                 # Contribution from this time point to variance
                 # The factor (time_horizon - t_i) accounts for the remaining area

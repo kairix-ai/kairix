@@ -53,11 +53,15 @@ class KaplanMeierFitter:
         alpha = kwargs.pop("alpha", 0.05)
         self._fitted_alpha = alpha
         
+        # Handle label: prefer passed kwarg (from compare_rmst), default to generic
+        # This prevents "multiple values for keyword argument 'label'" error
+        label = kwargs.pop("label", "survival_probability")
+        
         # Fit the lifelines estimator
         self._lifelines_kmf.fit(
             df[duration_col],
             df[event_col],
-            label="survival_probability", # Explicit label to simplify renaming
+            label=label, 
             alpha=alpha,
             **kwargs,
         )
@@ -81,6 +85,7 @@ class KaplanMeierFitter:
         # Create survival DataFrame
         # Lifelines returns index as time, column as label
         self.survival_df_ = self._lifelines_kmf.survival_function_.reset_index()
+        # We enforce a standard schema regardless of the internal label used
         self.survival_df_.columns = ["duration", "survival_probability"]
         
         # Standardize CIs into the main df immediately
@@ -219,7 +224,7 @@ class KaplanMeierFitter:
         group_2_data = df[df[group_col] == group_2_name]
         
         # Fit KMF for each group
-        # FIX: Pass the DataFrame and column strings, NOT the Series
+        # Passes df and column names to match the fit() signature
         kmf_1 = KaplanMeierFitter()
         kmf_1.fit(
             group_1_data,    # df

@@ -199,33 +199,8 @@ class KaplanMeierFitter:
         group_2_name: Optional[str] = None,
         alpha: float = 0.05,
     ) -> Dict[str, Any]:
-        """Compare RMST between two groups using log-rank style interface.
+        """Compare RMST between two groups using log-rank style interface."""
         
-        This is a static method that fits Kaplan-Meier estimators for both groups
-        and computes the RMST difference with statistical testing.
-        
-        Args:
-            df: DataFrame containing survival data.
-            duration_col: Column name for duration/time-to-event.
-            event_col: Column name for event indicator (0=censored, 1=event).
-            group_col: Column name for group assignment.
-            time_horizon: Time horizon for RMST calculation.
-            group_1_name: Name of the control group. If None, uses first unique value.
-            group_2_name: Name of the treatment group. If None, uses second unique value.
-            alpha: Significance level for the test.
-        
-        Returns:
-            Dictionary containing:
-                - diff: RMST treatment - RMST control
-                - p_value: Two-sided p-value from Z-test
-                - z_score: Z-statistic for the test
-                - horizon: The time horizon used
-                - significant: Whether the difference is statistically significant
-                - treatment_rmst: RMST of treatment group
-                - control_rmst: RMST of control group
-                - group_1_name: Name of control group
-                - group_2_name: Name of treatment group
-        """
         # Get unique groups
         unique_groups = df[group_col].unique().tolist()
         if len(unique_groups) != 2:
@@ -244,17 +219,20 @@ class KaplanMeierFitter:
         group_2_data = df[df[group_col] == group_2_name]
         
         # Fit KMF for each group
+        # FIX: Pass the DataFrame and column strings, NOT the Series
         kmf_1 = KaplanMeierFitter()
         kmf_1.fit(
-            group_1_data[duration_col],
-            group_1_data[event_col],
+            group_1_data,    # df
+            duration_col,    # col name string
+            event_col,       # col name string
             label=group_1_name,
         )
         
         kmf_2 = KaplanMeierFitter()
         kmf_2.fit(
-            group_2_data[duration_col],
-            group_2_data[event_col],
+            group_2_data,    # df
+            duration_col,    # col name string
+            event_col,       # col name string
             label=group_2_name,
         )
         
